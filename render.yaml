@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: ir-predictor-360
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: DB_FILE
+        value: /var/data/ir_predictor360.sqlite3
+      - key: BACKUP_DIR
+        value: /var/data/backups
+      - key: RUN_COLLECTOR
+        value: "1"
+      - key: COLLECT_INTERVAL
+        value: "8"
+      - key: BACKUP_INTERVAL_SECONDS
+        value: "21600"
+      - key: BACKUP_KEEP
+        value: "14"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PANEL_USER
+        value: admin
+      - key: PANEL_PASSWORD
+        sync: false
+
+    disk:
+      name: ir360-data
+      mountPath: /var/data
+      sizeGB: 1
