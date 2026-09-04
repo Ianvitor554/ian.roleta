@@ -1,0 +1,2891 @@
+Salve TODO o conteúdo abaixo como app.py
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import atexit
+import base64
+import csv
+import io
+import json
+import logging
+import math
+import os
+import sqlite3
+import shutil
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from flask import Flask, Response, jsonify, request
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+APP_VERSION = "3.5-mega-roulette-professional-learning"
+
+API_URL = os.getenv(
+    "API_URL",
+    "https://api-cs.casino.org/svc-evolution-game-events/api/"
+    "megaroulette?page=0&size=27&sort=data.settledAt,desc&duration=6&isLightningNumberMatched=false",
+)
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+DB_FILE = Path(os.getenv("DB_FILE", str(DATA_DIR / "roulette_clean_ai.sqlite3")))
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(DATA_DIR / "backups")))
+
+COLLECT_INTERVAL = max(5, int(os.getenv("COLLECT_INTERVAL", "8")))
+RUN_COLLECTOR = os.getenv("RUN_COLLECTOR", "1") == "1"
+HISTORY_LIMIT = max(500, int(os.getenv("HISTORY_LIMIT", "5000")))
+
+AI_MIN_SAMPLES = max(30, int(os.getenv("AI_MIN_SAMPLES", "120")))
+AI_LR = float(os.getenv("AI_LR", "0.035"))
+AI_L2 = float(os.getenv("AI_L2", "0.0008"))
+AI_MAX_BLEND = float(os.getenv("AI_MAX_BLEND", "0.38"))
+
+GREEN_MIN_RESOLVED = max(30, int(os.getenv("GREEN_MIN_RESOLVED", "120")))
+GREEN_SCORE = float(os.getenv("GREEN_SCORE", "88"))
+YELLOW_SCORE = float(os.getenv("YELLOW_SCORE", "68"))
+MIN_WINDOW_AGREEMENT = float(os.getenv("MIN_WINDOW_AGREEMENT", "0.48"))
+MAX_GREEN_LOSS_STREAK = max(0, int(os.getenv("MAX_GREEN_LOSS_STREAK", "2")))
+
+MIN_CENTER_1 = float(os.getenv("MIN_CENTER_1", "76"))
+MIN_CENTER_2 = float(os.getenv("MIN_CENTER_2", "70"))
+MIN_CENTER_3 = float(os.getenv("MIN_CENTER_3", "64"))
+
+MIN_CHIP = max(0.01, float(os.getenv("MIN_CHIP", "2.50")))
+BANKROLL = max(0.0, float(os.getenv("BANKROLL", "500")))
+RISK_PCT = max(0.0, float(os.getenv("RISK_PCT", "5.0")))
+
+# Rede resiliente
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "5"))
+READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "12"))
+HTTP_RETRIES = max(0, int(os.getenv("HTTP_RETRIES", "2")))
+BACKOFF_MAX = max(30, int(os.getenv("BACKOFF_MAX", "120")))
+BACKFILL_PAGES = max(1, min(8, int(os.getenv("BACKFILL_PAGES", "4"))))
+
+# Precisão V2
+GREEN_PLUS_SCORE = float(os.getenv("GREEN_PLUS_SCORE", "93"))
+GREEN_ELITE_SCORE = float(os.getenv("GREEN_ELITE_SCORE", "96"))
+MIN_MODEL_CONSENSUS = float(os.getenv("MIN_MODEL_CONSENSUS", "0.60"))
+REGIME_WARN_TV = float(os.getenv("REGIME_WARN_TV", "0.22"))
+REGIME_BLOCK_TV = float(os.getenv("REGIME_BLOCK_TV", "0.38"))
+CALIBRATION_MIN_N = max(20, int(os.getenv("CALIBRATION_MIN_N", "60")))
+MEGA_STATS_WINDOW = max(30, int(os.getenv("MEGA_STATS_WINDOW", "300")))
+STALE_DATA_SECONDS = max(30, int(os.getenv("STALE_DATA_SECONDS", "120")))
+AI_SKILL_MIN_SAMPLES = max(30, int(os.getenv("AI_SKILL_MIN_SAMPLES", "80")))
+CLOUD_MODE = os.getenv("CLOUD_MODE", "0") == "1"
+MAX_BACKFILL_PAGES = max(4, min(200, int(os.getenv("MAX_BACKFILL_PAGES", "80"))))
+DEEP_SYNC_INTERVAL = max(300, int(os.getenv("DEEP_SYNC_INTERVAL", "1800")))
+BACKUP_INTERVAL = max(900, int(os.getenv("BACKUP_INTERVAL", "3600")))
+BACKUP_KEEP = max(3, int(os.getenv("BACKUP_KEEP", "14")))
+COLLECTOR_RESTART_DELAY = max(3, int(os.getenv("COLLECTOR_RESTART_DELAY", "5")))
+
+# Motor de Puxadores V3.2
+PULLER_LONG_WINDOW = max(300, int(os.getenv("PULLER_LONG_WINDOW", "3000")))
+PULLER_RECENT_WINDOW = max(100, int(os.getenv("PULLER_RECENT_WINDOW", "600")))
+PULLER_PAIR_WINDOW = max(300, int(os.getenv("PULLER_PAIR_WINDOW", "2500")))
+PULLER_PRIOR_ALPHA = max(0.20, float(os.getenv("PULLER_PRIOR_ALPHA", "1.20")))
+PULLER_MIN_SOURCE_SUPPORT = max(3, int(os.getenv("PULLER_MIN_SOURCE_SUPPORT", "8")))
+PULLER_STRONG_SOURCE_SUPPORT = max(PULLER_MIN_SOURCE_SUPPORT, int(os.getenv("PULLER_STRONG_SOURCE_SUPPORT", "18")))
+PULLER_SKILL_MIN_SAMPLES = max(30, int(os.getenv("PULLER_SKILL_MIN_SAMPLES", "100")))
+PULLER_MAX_BLEND = max(0.0, min(0.45, float(os.getenv("PULLER_MAX_BLEND", "0.24"))))
+PULLER_RECENCY_DECAY = max(0.95, min(0.9999, float(os.getenv("PULLER_RECENCY_DECAY", "0.992"))))
+PULLER_MIN_DISPLAY_STRENGTH = float(os.getenv("PULLER_MIN_DISPLAY_STRENGTH", "20"))
+PULLER_BOOTSTRAP_POINTS = max(100, min(1500, int(os.getenv("PULLER_BOOTSTRAP_POINTS", "700"))))
+
+# Inteligência específica por rodada V3.3
+ROUND_LOCAL_MAX_EVENTS = max(12, min(120, int(os.getenv("ROUND_LOCAL_MAX_EVENTS", "60"))))
+ROUND_LOCAL_MIN_EVENTS = max(6, int(os.getenv("ROUND_LOCAL_MIN_EVENTS", "12")))
+ROUND_STRONG_EVIDENCE = float(os.getenv("ROUND_STRONG_EVIDENCE", "82"))
+ROUND_GOOD_EVIDENCE = float(os.getenv("ROUND_GOOD_EVIDENCE", "70"))
+ROUND_MAX_SPECIAL_BLEND = max(0.20, min(0.60, float(os.getenv("ROUND_MAX_SPECIAL_BLEND", "0.48"))))
+ROUND_AI_ALIGNMENT_MIN = float(os.getenv("ROUND_AI_ALIGNMENT_MIN", "0.18"))
+
+# V3.4: ensemble adaptativo + calibração + contador integral
+MODEL_WEIGHT_MIN_SAMPLES = max(20, int(os.getenv("MODEL_WEIGHT_MIN_SAMPLES", "80")))
+MODEL_WEIGHT_EMA_ALPHA = max(0.005, min(0.20, float(os.getenv("MODEL_WEIGHT_EMA_ALPHA", "0.035"))))
+MODEL_WEIGHT_TAU = max(0.05, float(os.getenv("MODEL_WEIGHT_TAU", "0.22")))
+TEMP_CALIBRATION_MIN = max(20, int(os.getenv("TEMP_CALIBRATION_MIN", "60")))
+TEMP_CALIBRATION_LIMIT = max(50, min(1000, int(os.getenv("TEMP_CALIBRATION_LIMIT", "300"))))
+SPIN_PAGE_MAX = max(100, min(2000, int(os.getenv("SPIN_PAGE_MAX", "500"))))
+NUMBER_STATS_RECENT = max(100, int(os.getenv("NUMBER_STATS_RECENT", "300")))
+
+# V3.4.1: proteção e recuperação SQLite
+DB_AUTO_RECOVER = os.getenv("DB_AUTO_RECOVER", "1") == "1"
+DB_CHECK_INTERVAL = max(300, int(os.getenv("DB_CHECK_INTERVAL", "900")))
+WAL_CHECKPOINT_INTERVAL = max(120, int(os.getenv("WAL_CHECKPOINT_INTERVAL", "300")))
+DB_QUARANTINE_DIR = Path(os.getenv("DB_QUARANTINE_DIR", str(BACKUP_DIR / "corrupt")))
+
+# V3.5 Professional Learning
+PRO_MODEL_FAST_ALPHA = max(0.01, min(0.30, float(os.getenv("PRO_MODEL_FAST_ALPHA", "0.080"))))
+PRO_MODEL_SLOW_ALPHA = max(0.002, min(0.10, float(os.getenv("PRO_MODEL_SLOW_ALPHA", "0.015"))))
+PRO_REGIME_MIN_SAMPLES = max(12, int(os.getenv("PRO_REGIME_MIN_SAMPLES", "30")))
+PRO_WEIGHT_FLOOR = max(0.001, min(0.10, float(os.getenv("PRO_WEIGHT_FLOOR", "0.020"))))
+PRO_EVIDENCE_LIMIT = max(100, min(3000, int(os.getenv("PRO_EVIDENCE_LIMIT", "600"))))
+PRO_EDGE_MIN_GREEN_N = max(15, int(os.getenv("PRO_EDGE_MIN_GREEN_N", "40")))
+PRO_EDGE_YELLOW_Z = float(os.getenv("PRO_EDGE_YELLOW_Z", "-0.35"))
+PRO_EDGE_RED_Z = float(os.getenv("PRO_EDGE_RED_Z", "-1.00"))
+PRO_ELITE_MIN_Z = float(os.getenv("PRO_ELITE_MIN_Z", "0.50"))
+PRO_MIN_TRACKED_MODELS = max(2, int(os.getenv("PRO_MIN_TRACKED_MODELS", "4")))
+PRO_MIN_MODELS_BEATING_UNIFORM = max(0, int(os.getenv("PRO_MIN_MODELS_BEATING_UNIFORM", "1")))
+PRO_LEARNING_BIN = max(20, int(os.getenv("PRO_LEARNING_BIN", "50")))
+
+AI_LABEL_SMOOTHING = max(0.0, min(0.12, float(os.getenv("AI_LABEL_SMOOTHING", "0.025"))))
+AI_ADAGRAD_EPS = max(1e-12, float(os.getenv("AI_ADAGRAD_EPS", "1e-7")))
+AI_GRAD_CLIP = max(0.10, float(os.getenv("AI_GRAD_CLIP", "1.50")))
+AI_WEIGHT_CLIP = max(0.50, float(os.getenv("AI_WEIGHT_CLIP", "2.50")))
+AI_FAST_ALPHA = max(0.01, min(0.30, float(os.getenv("AI_FAST_ALPHA", "0.080"))))
+AI_SLOW_ALPHA = max(0.002, min(0.10, float(os.getenv("AI_SLOW_ALPHA", "0.015"))))
+
+PANEL_USER = os.getenv("PANEL_USER", "").strip()
+PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "").strip()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+DB_QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("clean-ai")
+
+# ============================================================
+# ROLETA EUROPEIA
+# ============================================================
+
+WHEEL = [
+    0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,
+    33,1,20,14,31,9,22,18,29,7,28,12,35,3,26
+]
+WHEEL_INDEX = {n:i for i,n in enumerate(WHEEL)}
+RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+
+VOISINS = {22,18,29,7,28,12,35,3,26,0,32,15,19,4,21,2,25}
+TIERS = {27,13,36,11,30,8,23,10,5,24,16,33}
+ORPHELINS = {1,20,14,31,9,17,34,6}
+
+UNIFORM_P = 1/37
+UNIFORM_LOG_LOSS = math.log(37.0)
+UNIFORM_BRIER = 36.0/37.0
+
+FEATURES = [
+    "bias","transicao","freq20","freq50","freq100","freq300","freq1000",
+    "cluster_roda","terminal","atraso","perto_ultimo","mesmo_terminal",
+    "mesma_cor","mesma_duzia","setor"
+]
+
+
+MODEL_PRIORS = {
+    "transicao_simples": 0.08,
+    "puxadores_bayes": 0.14,
+    "frequencia_curta": 0.14,
+    "frequencia_longa": 0.18,
+    "roda_fisica": 0.18,
+    "contexto": 0.10,
+    "ia_online": 0.18,
+}
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def iso_age_seconds(value):
+    if not value:
+        return None
+    try:
+        dt=datetime.fromisoformat(str(value).replace("Z","+00:00"))
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=timezone.utc)
+        return max(0.0,(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+def clamp(x,a,b):
+    return max(a,min(b,x))
+
+def normalize(v):
+    v = [max(0.0,float(x)) for x in v]
+    s = sum(v)
+    return [x/s for x in v] if s > 0 else [UNIFORM_P]*37
+
+def softmax(logits):
+    m = max(logits)
+    e = [math.exp(clamp(x-m,-40,40)) for x in logits]
+    return normalize(e)
+
+
+def temperature_scale(probs, temperature):
+    t=max(0.35,min(3.0,float(temperature or 1.0)))
+    if abs(t-1.0)<1e-9:
+        return normalize(probs)
+    inv=1.0/t
+    return normalize([max(1e-12,float(p))**inv for p in probs])
+
+def topk(probs,k):
+    return sorted(range(37), key=lambda n: probs[n], reverse=True)[:k]
+
+def mass(probs, nums):
+    return sum(probs[n] for n in set(nums))
+
+def neighbors(n,r=2):
+    i = WHEEL_INDEX[int(n)]
+    return [WHEEL[(i+d)%37] for d in range(-r,r+1)]
+
+def wheel_distance(a,b):
+    ia, ib = WHEEL_INDEX[int(a)], WHEEL_INDEX[int(b)]
+    d = abs(ia-ib)
+    return min(d,37-d)
+
+def color(n):
+    n=int(n)
+    if n==0: return "green"
+    return "red" if n in RED else "black"
+
+def dozen(n):
+    n=int(n)
+    return 0 if n==0 else 1+(n-1)//12
+
+def terminal(n):
+    return int(n)%10
+
+def sector(n):
+    n=int(n)
+    if n in VOISINS: return "voisins"
+    if n in TIERS: return "tiers"
+    return "orphelins"
+
+def brier(probs, actual):
+    return sum((probs[i]-(1.0 if i==actual else 0.0))**2 for i in range(37))
+
+def logloss(probs, actual):
+    return -math.log(clamp(probs[actual],1e-12,1.0))
+
+def pnl(coverage, actual, chip):
+    cov = list(dict.fromkeys(coverage))
+    total = len(cov)*chip
+    return round((36*chip-total) if actual in cov else -total,2)
+
+
+def url_for_page(page):
+    parts = urlsplit(API_URL)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q["page"] = str(int(page))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+
+def tv_distance(p, q):
+    return 0.5 * sum(abs(float(a)-float(b)) for a,b in zip(p,q))
+
+def regime_analysis(nums):
+    """
+    Mede mudança entre os últimos 30 giros e o bloco anterior.
+    TV=0 -> distribuições parecidas; quanto maior, mais houve mudança.
+    """
+    if len(nums) < 60:
+        return {"tv":0.0, "level":"WARMUP", "stable":False}
+    recent = freq_probs(nums[-30:], 30)
+    prior_slice = nums[-330:-30] if len(nums) >= 330 else nums[:-30]
+    prior = freq_probs(prior_slice, max(20, len(prior_slice)))
+    tv = tv_distance(recent, prior)
+    if tv >= REGIME_BLOCK_TV:
+        level = "MUDANÇA_FORTE"
+    elif tv >= REGIME_WARN_TV:
+        level = "MUDANDO"
+    else:
+        level = "ESTÁVEL"
+    return {"tv":round(tv,4), "level":level, "stable":tv < REGIME_WARN_TV}
+
+def independent_models(nums, ai_probs):
+    """Sete visões independentes usadas para consenso."""
+    pull_probs,_=puller_model(nums)
+    short = normalize([
+        0.45*freq_probs(nums,20)[i] + 0.55*freq_probs(nums,50)[i]
+        for i in range(37)
+    ])
+    long = normalize([
+        0.35*freq_probs(nums,100)[i] + 0.35*freq_probs(nums,300)[i] + 0.30*freq_probs(nums,1000)[i]
+        for i in range(37)
+    ])
+    context = normalize([
+        0.65*terminal_probs(nums)[i] + 0.35*sector_probs(nums)[i]
+        for i in range(37)
+    ])
+    return {
+        "transicao_simples": trans_probs(nums),
+        "puxadores_bayes": pull_probs,
+        "frequencia_curta": short,
+        "frequencia_longa": long,
+        "roda_fisica": cluster_probs(nums),
+        "contexto": context,
+        "ia_online": ai_probs,
+    }
+
+def consensus_for_center(center, models, model_weights=None):
+    zone = set(neighbors(center,2))
+    support = 0.0
+    total_weight = 0.0
+    details = {}
+    baseline = len(zone)/37
+    default_w=1/max(1,len(models))
+    for name,p in models.items():
+        in_top = center in topk(p,8)
+        zone_lift = mass(p, zone) / baseline if baseline else 1.0
+        ok = in_top or zone_lift >= 1.05
+        w=float((model_weights or {}).get(name,default_w))
+        support += w*int(ok); total_weight += w
+        details[name] = {
+            "support":ok,"weight_pct":round(100*w,2),
+            "zone_lift":round(zone_lift,3),"center_top8":in_top,
+        }
+    ratio = support/max(1e-9,total_weight)
+    return ratio, details
+
+# ============================================================
+# SQLITE
+# ============================================================
+
+class DB:
+    def __init__(self,path):
+        self.path = Path(path)
+        self.lock = threading.RLock()
+        self.path.parent.mkdir(parents=True,exist_ok=True)
+        self._recovering=False
+        self.recovery_state={
+            "status":"STARTING",
+            "last_action":None,
+            "last_error":None,
+            "restored_from":None,
+            "quarantine_dir":None,
+            "checked_at":None,
+        }
+
+        # Antes de executar WAL ou DDL, verifica se o arquivo existente é legível.
+        if DB_AUTO_RECOVER:
+            self.recover_if_needed(startup=True)
+
+        self.init()
+
+    def _basic_conn(self,path=None,readonly=False):
+        p=Path(path or self.path)
+        if readonly:
+            uri=f"file:{p.resolve()}?mode=ro"
+            c=sqlite3.connect(uri,uri=True,timeout=15)
+        else:
+            c=sqlite3.connect(p,timeout=30)
+        c.row_factory=sqlite3.Row
+        c.execute("PRAGMA busy_timeout=30000")
+        return c
+
+    def _validate_path(self,path):
+        p=Path(path)
+        if not p.exists():
+            return True,"missing"
+        try:
+            c=self._basic_conn(p,readonly=True)
+            try:
+                row=c.execute("PRAGMA quick_check").fetchone()
+                result=(row[0] if row else "unknown")
+                return result=="ok",str(result)
+            finally:
+                c.close()
+        except Exception as exc:
+            return False,f"{type(exc).__name__}: {exc}"
+
+    def _quarantine_current(self,reason):
+        stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+        qdir=DB_QUARANTINE_DIR/f"db_corrupt_{stamp}"
+        qdir.mkdir(parents=True,exist_ok=True)
+
+        moved=[]
+        for suffix in ("","-wal","-shm"):
+            src=Path(str(self.path)+suffix)
+            if src.exists():
+                dst=qdir/src.name
+                try:
+                    shutil.move(str(src),str(dst))
+                    moved.append(str(dst))
+                except Exception:
+                    try:
+                        shutil.copy2(src,dst)
+                        moved.append(str(dst))
+                        src.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        meta=qdir/"RECOVERY_INFO.txt"
+        try:
+            meta.write_text(
+                f"timestamp={now_iso()}\n"
+                f"database={self.path}\n"
+                f"reason={reason}\n"
+                f"files={moved}\n",
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+        self.recovery_state["quarantine_dir"]=str(qdir)
+        return qdir
+
+    def _healthy_backups(self):
+        items=[]
+        for p in sorted(BACKUP_DIR.glob("mega_ai_*.sqlite3"),reverse=True):
+            ok,msg=self._validate_path(p)
+            if ok:
+                items.append(p)
+            else:
+                log.warning("Backup inválido ignorado: %s (%s)",p,msg)
+        return items
+
+    def recover_if_needed(self,startup=False,force=False):
+        if self._recovering:
+            return False
+
+        with self.lock:
+            self._recovering=True
+            try:
+                self.recovery_state["checked_at"]=now_iso()
+
+                if not self.path.exists():
+                    self.recovery_state.update({
+                        "status":"NEW_DB",
+                        "last_action":"database file did not exist",
+                        "last_error":None,
+                    })
+                    return False
+
+                ok,msg=self._validate_path(self.path)
+                if ok and not force:
+                    self.recovery_state.update({
+                        "status":"OK",
+                        "last_action":"quick_check ok",
+                        "last_error":None,
+                    })
+                    return False
+
+                if not ok:
+                    reason=msg
+                else:
+                    reason="forced recovery"
+
+                self.recovery_state.update({
+                    "status":"RECOVERING",
+                    "last_error":reason,
+                })
+                log.error("SQLite inválido detectado: %s",reason)
+
+                qdir=self._quarantine_current(reason)
+
+                # Primeiro tenta restaurar o backup mais novo que esteja íntegro.
+                healthy=self._healthy_backups()
+                if healthy:
+                    backup=healthy[0]
+                    shutil.copy2(backup,self.path)
+
+                    # Remove qualquer sidecar residual.
+                    for suffix in ("-wal","-shm"):
+                        Path(str(self.path)+suffix).unlink(missing_ok=True)
+
+                    ok2,msg2=self._validate_path(self.path)
+                    if ok2:
+                        self.recovery_state.update({
+                            "status":"RESTORED_BACKUP",
+                            "last_action":"restored healthy backup",
+                            "last_error":None,
+                            "restored_from":str(backup),
+                            "quarantine_dir":str(qdir),
+                        })
+                        log.warning("SQLite restaurado automaticamente de %s",backup)
+                        return True
+
+                    log.error("Backup restaurado também falhou: %s",msg2)
+                    try:
+                        self.path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+                # Nenhum backup íntegro disponível: cria DB novo.
+                for suffix in ("","-wal","-shm"):
+                    Path(str(self.path)+suffix).unlink(missing_ok=True)
+
+                self.recovery_state.update({
+                    "status":"FRESH_DB",
+                    "last_action":"created fresh database; corrupt copy preserved",
+                    "restored_from":None,
+                    "quarantine_dir":str(qdir),
+                })
+                log.error(
+                    "Nenhum backup íntegro encontrado. Banco novo será criado. "
+                    "Arquivo corrompido preservado em %s",qdir
+                )
+                return True
+
+            finally:
+                self._recovering=False
+
+    def _open_configured(self):
+        c=self._basic_conn(self.path,readonly=False)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA busy_timeout=30000")
+        return c
+
+    def conn(self):
+        try:
+            return self._open_configured()
+        except sqlite3.DatabaseError as exc:
+            msg=str(exc).lower()
+            corrupt=(
+                "malformed" in msg
+                or "disk image" in msg
+                or "file is not a database" in msg
+                or "database corruption" in msg
+            )
+            if not (DB_AUTO_RECOVER and corrupt):
+                raise
+
+            log.error("Erro SQLite em runtime: %s. Iniciando recuperação.",exc)
+            self.recover_if_needed(force=True)
+
+            # Um DB novo precisa da estrutura antes da consulta original.
+            self.init()
+            return self._open_configured()
+
+    def init(self):
+        with self.lock, self.conn() as c:
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS spins(
+                round_id TEXT PRIMARY KEY,
+                number INTEGER NOT NULL,
+                settled_at TEXT,
+                inserted_at TEXT NOT NULL,
+                lucky_json TEXT,
+                table_name TEXT,
+                game_type TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS predictions(
+                source_round_id TEXT PRIMARY KEY,
+                source_number INTEGER NOT NULL,
+                predicted_at TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                quality REAL NOT NULL,
+                threshold REAL NOT NULL,
+                reason TEXT,
+                centers_json TEXT NOT NULL,
+                zones_json TEXT NOT NULL,
+                coverage_json TEXT NOT NULL,
+                center_details_json TEXT NOT NULL,
+                probs_json TEXT NOT NULL,
+                features_json TEXT NOT NULL,
+                weights_json TEXT NOT NULL,
+                ai_metrics_json TEXT NOT NULL,
+                next_round_id TEXT,
+                actual INTEGER,
+                resolved_at TEXT,
+                hit INTEGER,
+                brier REAL,
+                log_loss REAL,
+                paper_pnl REAL,
+                explanation_json TEXT,
+                round_analysis_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS state(
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """)
+            cols={r[1] for r in c.execute("PRAGMA table_info(spins)").fetchall()}
+            for name,ctype in {
+                "lucky_json":"TEXT",
+                "table_name":"TEXT",
+                "game_type":"TEXT",
+            }.items():
+                if name not in cols:
+                    c.execute(f"ALTER TABLE spins ADD COLUMN {name} {ctype}")
+            pcols={r[1] for r in c.execute("PRAGMA table_info(predictions)").fetchall()}
+            if "round_analysis_json" not in pcols:
+                c.execute("ALTER TABLE predictions ADD COLUMN round_analysis_json TEXT")
+            if "model_version" not in pcols:
+                c.execute("ALTER TABLE predictions ADD COLUMN model_version TEXT")
+            c.commit()
+
+    def integrity(self):
+        try:
+            with self.lock,self.conn() as c:
+                return c.execute("PRAGMA quick_check").fetchone()[0]
+        except Exception as e:
+            return f"error: {e}"
+
+    def checkpoint(self,mode="PASSIVE"):
+        mode=str(mode).upper()
+        if mode not in {"PASSIVE","FULL","RESTART","TRUNCATE"}:
+            mode="PASSIVE"
+        with self.lock,self.conn() as c:
+            row=c.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        return list(row) if row else []
+
+    def recovery_info(self):
+        return dict(self.recovery_state)
+
+    def get_state(self,key,default=None):
+        with self.lock, self.conn() as c:
+            r = c.execute("SELECT value_json FROM state WHERE key=?",(key,)).fetchone()
+        if not r: return default
+        try: return json.loads(r[0])
+        except Exception: return default
+
+    def set_state(self,key,value):
+        with self.lock, self.conn() as c:
+            c.execute("""
+            INSERT INTO state(key,value_json,updated_at) VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at
+            """,(key,json.dumps(value,separators=(",",":")),now_iso()))
+            c.commit()
+
+    def insert_spin(self,rec):
+        with self.lock, self.conn() as c:
+            cur = c.execute("""
+            INSERT OR IGNORE INTO spins(
+                round_id,number,settled_at,inserted_at,lucky_json,table_name,game_type
+            ) VALUES(?,?,?,?,?,?,?)
+            """,(
+                str(rec["id"]),int(rec["number"]),rec.get("settledAt"),now_iso(),
+                json.dumps(rec.get("luckyNumbers",[]),separators=(",",":")),
+                rec.get("tableName"),rec.get("gameType")
+            ))
+            c.commit()
+            return cur.rowcount>0
+
+    def has_spin(self,rid):
+        with self.lock, self.conn() as c:
+            return bool(c.execute("SELECT 1 FROM spins WHERE round_id=?",(str(rid),)).fetchone())
+
+    def spins(self,limit=5000):
+        with self.lock, self.conn() as c:
+            rows = c.execute("""
+            SELECT round_id,number,settled_at,lucky_json,table_name,game_type
+            FROM spins ORDER BY rowid DESC LIMIT ?
+            """,(limit,)).fetchall()
+        out=[]
+        for r in reversed(rows):
+            try: lucky=json.loads(r["lucky_json"] or "[]")
+            except Exception: lucky=[]
+            out.append({
+                "id":r["round_id"],"number":r["number"],"settledAt":r["settled_at"],
+                "luckyNumbers":lucky,"tableName":r["table_name"],"gameType":r["game_type"]
+            })
+        return out
+
+    def count_spins(self):
+        with self.lock, self.conn() as c:
+            return c.execute("SELECT COUNT(*) FROM spins").fetchone()[0]
+
+
+    def spin_page(self,limit=200,offset=0,descending=True):
+        limit=max(1,min(SPIN_PAGE_MAX,int(limit)))
+        offset=max(0,int(offset))
+        order="DESC" if descending else "ASC"
+        with self.lock,self.conn() as c:
+            total=c.execute("SELECT COUNT(*) FROM spins").fetchone()[0]
+            rows=c.execute(f"""
+                SELECT rowid,round_id,number,settled_at,inserted_at,lucky_json,table_name,game_type
+                FROM spins ORDER BY rowid {order} LIMIT ? OFFSET ?
+            """,(limit,offset)).fetchall()
+        items=[]
+        for r in rows:
+            try: lucky=json.loads(r["lucky_json"] or "[]")
+            except Exception: lucky=[]
+            items.append({
+                "seq":int(r["rowid"]),"id":r["round_id"],"number":int(r["number"]),
+                "settledAt":r["settled_at"],"insertedAt":r["inserted_at"],
+                "luckyNumbers":lucky,"tableName":r["table_name"],"gameType":r["game_type"]
+            })
+        return {"total":total,"limit":limit,"offset":offset,"items":items}
+
+    def number_stats(self):
+        with self.lock,self.conn() as c:
+            rows=c.execute("SELECT rowid,number,settled_at FROM spins ORDER BY rowid ASC").fetchall()
+        total=len(rows)
+        positions=[[] for _ in range(37)]
+        last_time=[None]*37
+        nums=[]
+        for idx,r in enumerate(rows):
+            n=int(r["number"]); nums.append(n); positions[n].append(idx); last_time[n]=r["settled_at"]
+        windows=(20,50,100,300)
+        recent_counts={w:[0]*37 for w in windows}
+        for w in windows:
+            for n in nums[-w:]: recent_counts[w][n]+=1
+        expected=total/37 if total else 0.0
+        stats=[]
+        for n in range(37):
+            pos=positions[n]; count=len(pos)
+            current_gap=(total-1-pos[-1]) if pos else total
+            gaps=[pos[i]-pos[i-1]-1 for i in range(1,len(pos))]
+            max_gap=max(gaps+[current_gap]) if (gaps or total) else 0
+            mean_gap=(sum(gaps)/len(gaps)) if gaps else None
+            z=(count-expected)/math.sqrt(max(expected*(36/37),1e-9)) if expected else 0.0
+            stats.append({
+                "number":n,"count":count,"pct":100*count/total if total else 0.0,
+                "expected":expected,"z":z,"current_gap":current_gap,"max_gap":max_gap,
+                "mean_gap":mean_gap,"last_seen":last_time[n],
+                "count20":recent_counts[20][n],"count50":recent_counts[50][n],
+                "count100":recent_counts[100][n],"count300":recent_counts[300][n],
+                "wheel_zone":neighbors(n,2),"color":color(n)
+            })
+        return {
+            "total":total,"expected_per_number":expected,"stats":stats,
+            "most_common":sorted(stats,key=lambda x:(x["count"],-x["number"]),reverse=True)[:8],
+            "most_delayed":sorted(stats,key=lambda x:(x["current_gap"],x["count"]),reverse=True)[:8],
+            "note":"Contagem descritiva do histórico coletado; atraso/frequência não alteram a chance física de uma roleta justa."
+        }
+
+    def prediction_exists(self,rid):
+        with self.lock, self.conn() as c:
+            return bool(c.execute("SELECT 1 FROM predictions WHERE source_round_id=?",(str(rid),)).fetchone())
+
+    def insert_prediction(self,row):
+        with self.lock, self.conn() as c:
+            cur = c.execute("""
+            INSERT OR IGNORE INTO predictions(
+                source_round_id,source_number,predicted_at,signal,quality,threshold,reason,
+                centers_json,zones_json,coverage_json,center_details_json,
+                probs_json,features_json,weights_json,ai_metrics_json,round_analysis_json,model_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,(
+                str(row["source_round_id"]),int(row["source_number"]),row["predicted_at"],
+                row["signal"],float(row["quality"]),float(row["threshold"]),row["reason"],
+                json.dumps(row["centers"]),json.dumps(row["zones"]),json.dumps(row["coverage"]),
+                json.dumps(row["center_details"]),json.dumps(row["probs"]),
+                json.dumps(row["features"]),json.dumps(row["weights"]),
+                json.dumps(row["ai_metrics"]),json.dumps(row.get("round_analysis",{})),
+                row.get("model_version",APP_VERSION)
+            ))
+            c.commit()
+            return cur.rowcount>0
+
+    def unresolved(self,rid):
+        with self.lock, self.conn() as c:
+            r = c.execute("""
+            SELECT * FROM predictions WHERE source_round_id=? AND resolved_at IS NULL
+            """,(str(rid),)).fetchone()
+        return dict(r) if r else None
+
+    def resolve(self,source_rid,next_rid,actual,explanation):
+        with self.lock, self.conn() as c:
+            r = c.execute("""
+            SELECT coverage_json,probs_json FROM predictions
+            WHERE source_round_id=? AND resolved_at IS NULL
+            """,(str(source_rid),)).fetchone()
+            if not r: return False
+            coverage = json.loads(r["coverage_json"])
+            probs = json.loads(r["probs_json"])
+            hit = int(actual in coverage)
+            c.execute("""
+            UPDATE predictions SET next_round_id=?,actual=?,resolved_at=?,hit=?,
+            brier=?,log_loss=?,paper_pnl=?,explanation_json=?
+            WHERE source_round_id=?
+            """,(
+                str(next_rid),int(actual),now_iso(),hit,brier(probs,actual),
+                logloss(probs,actual),pnl(coverage,actual,MIN_CHIP),
+                json.dumps(explanation),str(source_rid)
+            ))
+            c.commit()
+            return True
+
+    def history(self,limit=100):
+        with self.lock, self.conn() as c:
+            rows = c.execute("SELECT * FROM predictions ORDER BY rowid DESC LIMIT ?",(limit,)).fetchall()
+        out=[]
+        for rr in rows:
+            d=dict(rr)
+            for key,new,default in [
+                ("centers_json","centers",[]),("zones_json","zones",{}),
+                ("coverage_json","coverage",[]),("center_details_json","center_details",[]),
+                ("ai_metrics_json","ai_metrics",{}),("explanation_json","explanation",[]),
+                ("round_analysis_json","round_analysis",{})
+            ]:
+                raw=d.pop(key,None)
+                try: d[new]=json.loads(raw) if raw else default
+                except Exception: d[new]=default
+            d.pop("probs_json",None); d.pop("features_json",None); d.pop("weights_json",None)
+            d["hit"] = None if d["hit"] is None else bool(d["hit"])
+            out.append(d)
+        return out
+
+    def metrics(self,limit=1000):
+        with self.lock,self.conn() as c:
+            rows=c.execute("""
+            SELECT signal,hit,paper_pnl,coverage_json,brier,log_loss
+            FROM predictions WHERE resolved_at IS NOT NULL
+            ORDER BY rowid DESC LIMIT ?
+            """,(limit,)).fetchall()
+        if not rows:
+            return {"resolved":0,"coverage_hit_pct":0,"baseline_pct":0,"green_count":0,
+                    "green_hit_pct":0,"green_baseline_pct":0,"green_pnl":0,
+                    "green_loss_streak":0,"avg_brier":None,"avg_log_loss":None}
+        hits=sum(int(r["hit"] or 0) for r in rows)
+        baselines=[len(set(json.loads(r["coverage_json"])))/37 for r in rows]
+        greens=[r for r in rows if str(r["signal"]).startswith("GREEN")]
+        gh=sum(int(r["hit"] or 0) for r in greens)
+        gb=[len(set(json.loads(r["coverage_json"])))/37 for r in greens]
+        streak=0
+        for r in greens:
+            if r["hit"]: break
+            streak+=1
+        return {
+            "resolved":len(rows),
+            "coverage_hit_pct":100*hits/len(rows),
+            "baseline_pct":100*sum(baselines)/len(baselines),
+            "green_count":len(greens),
+            "green_hit_pct":100*gh/len(greens) if greens else 0,
+            "green_baseline_pct":100*sum(gb)/len(gb) if gb else 0,
+            "green_pnl":round(sum(float(r["paper_pnl"] or 0) for r in greens),2),
+            "green_loss_streak":streak,
+            "avg_brier":sum(float(r["brier"]) for r in rows)/len(rows),
+            "avg_log_loss":sum(float(r["log_loss"]) for r in rows)/len(rows),
+        }
+
+    def mega_stats(self,limit=MEGA_STATS_WINDOW):
+        with self.lock,self.conn() as c:
+            rows=c.execute("""
+            SELECT number,lucky_json,settled_at FROM spins
+            ORDER BY rowid DESC LIMIT ?
+            """,(int(limit),)).fetchall()
+
+        lucky_counts=[0]*37
+        mult_sum=[0.0]*37
+        mult_n=[0]*37
+        total_lucky=0
+        max_multiplier=0
+        multipliers=[]
+        last_lucky=[]
+        for idx,r in enumerate(rows):
+            try: lucky=json.loads(r["lucky_json"] or "[]")
+            except Exception: lucky=[]
+            if idx==0: last_lucky=lucky
+            total_lucky+=len(lucky)
+            for item in lucky:
+                try:
+                    n=int(item.get("number"))
+                    m=float(item.get("roundedMultiplier",0) or 0)
+                    if 0<=n<=36:
+                        lucky_counts[n]+=1
+                        mult_sum[n]+=m
+                        mult_n[n]+=1
+                    if m>0:
+                        multipliers.append(m)
+                        max_multiplier=max(max_multiplier,m)
+                except Exception:
+                    pass
+
+        nrows=len(rows)
+        top_numbers=sorted(range(37),key=lambda n:lucky_counts[n],reverse=True)[:8]
+        return {
+            "rounds":nrows,
+            "last_lucky":last_lucky,
+            "avg_lucky_per_round":(total_lucky/nrows if nrows else 0.0),
+            "avg_multiplier":(sum(multipliers)/len(multipliers) if multipliers else 0.0),
+            "max_multiplier":max_multiplier,
+            "top_lucky_numbers":[
+                {
+                    "number":n,
+                    "count":lucky_counts[n],
+                    "pct_rounds":100*lucky_counts[n]/nrows if nrows else 0.0,
+                    "avg_multiplier":mult_sum[n]/mult_n[n] if mult_n[n] else 0.0,
+                } for n in top_numbers if lucky_counts[n]>0
+            ],
+            "note":"Bônus Mega são exibidos separadamente e não entram no modelo preditivo principal."
+        }
+
+    def calibration(self,limit=600):
+        with self.lock,self.conn() as c:
+            rows=c.execute("""
+            SELECT probs_json,coverage_json,hit
+            FROM predictions
+            WHERE resolved_at IS NOT NULL
+            ORDER BY rowid DESC LIMIT ?
+            """,(limit,)).fetchall()
+
+        if not rows:
+            return {"n":0,"expected_pct":0.0,"observed_pct":0.0,"gap_pp":0.0,"ece":0.0}
+
+        bins = [[] for _ in range(5)]
+        expected = []
+        observed = []
+        for r in rows:
+            probs=json.loads(r["probs_json"])
+            coverage=json.loads(r["coverage_json"])
+            p=mass(probs,coverage)
+            y=float(r["hit"] or 0)
+            expected.append(p); observed.append(y)
+            idx=min(4,int(p*5))
+            bins[idx].append((p,y))
+
+        ece=0.0
+        n=len(rows)
+        for b in bins:
+            if not b: continue
+            ep=sum(x[0] for x in b)/len(b)
+            op=sum(x[1] for x in b)/len(b)
+            ece += (len(b)/n)*abs(ep-op)
+
+        exp=sum(expected)/n
+        obs=sum(observed)/n
+        return {
+            "n":n,
+            "expected_pct":100*exp,
+            "observed_pct":100*obs,
+            "gap_pp":100*(obs-exp),
+            "ece":100*ece,
+        }
+
+    def professional_edge_evidence(self,limit=PRO_EVIDENCE_LIMIT,model_version=None):
+        def fetch(version):
+            with self.lock,self.conn() as c:
+                if version:
+                    return c.execute("""
+                        SELECT signal,coverage_json,hit,paper_pnl
+                        FROM predictions
+                        WHERE resolved_at IS NOT NULL AND hit IS NOT NULL AND model_version=?
+                        ORDER BY rowid DESC LIMIT ?
+                    """,(version,int(limit))).fetchall()
+                return c.execute("""
+                    SELECT signal,coverage_json,hit,paper_pnl
+                    FROM predictions
+                    WHERE resolved_at IS NOT NULL AND hit IS NOT NULL
+                    ORDER BY rowid DESC LIMIT ?
+                """,(int(limit),)).fetchall()
+
+        rows=fetch(model_version) if model_version else fetch(None)
+        scope="current_version" if model_version else "recent_all_versions"
+        if model_version and len(rows)<30:
+            rows=fetch(None)
+            scope="recent_all_versions_fallback"
+
+        def summarize(items):
+            if not items:
+                return {"n":0,"hits":0,"observed_pct":0.0,"expected_pct":0.0,
+                        "edge_pp":0.0,"z_score":0.0,"paper_pnl":0.0}
+            obs=exp=var=pnl_total=0.0
+            for r in items:
+                try:
+                    cov=list(dict.fromkeys(json.loads(r["coverage_json"] or "[]")))
+                except Exception:
+                    cov=[]
+                p=clamp(len(cov)/37,1e-9,1-1e-9)
+                y=float(r["hit"] or 0)
+                obs+=y
+                exp+=p
+                var+=p*(1-p)
+                pnl_total+=float(r["paper_pnl"] or 0.0)
+            n=len(items)
+            return {
+                "n":n,
+                "hits":int(obs),
+                "observed_pct":100*obs/n,
+                "expected_pct":100*exp/n,
+                "edge_pp":100*(obs-exp)/n,
+                "z_score":(obs-exp)/math.sqrt(max(var,1e-9)),
+                "paper_pnl":round(pnl_total,2),
+            }
+
+        all_rows=list(rows)
+        greens=[r for r in all_rows if str(r["signal"] or "").startswith("GREEN")]
+        return {"scope":scope,"limit":int(limit),
+                "all":summarize(all_rows),"green":summarize(greens)}
+
+    def learning_curve(self,limit=600,bin_size=PRO_LEARNING_BIN):
+        with self.lock,self.conn() as c:
+            rows=c.execute("""
+                SELECT log_loss,brier,hit,coverage_json,model_version
+                FROM predictions
+                WHERE resolved_at IS NOT NULL AND log_loss IS NOT NULL
+                ORDER BY rowid DESC LIMIT ?
+            """,(int(limit),)).fetchall()
+        rows=list(reversed(rows))
+        bins=[]
+        bs=max(10,int(bin_size))
+        for start in range(0,len(rows),bs):
+            block=rows[start:start+bs]
+            if len(block)<max(10,bs//2):
+                continue
+            ll=[float(r["log_loss"]) for r in block]
+            br=[float(r["brier"]) for r in block if r["brier"] is not None]
+            hits=sum(int(r["hit"] or 0) for r in block)
+            bases=[]
+            for r in block:
+                try:
+                    cov=list(dict.fromkeys(json.loads(r["coverage_json"] or "[]")))
+                    bases.append(len(cov)/37)
+                except Exception:
+                    pass
+            bins.append({
+                "n":len(block),
+                "avg_log_loss":sum(ll)/len(ll),
+                "avg_brier":sum(br)/len(br) if br else None,
+                "hit_pct":100*hits/len(block),
+                "baseline_pct":100*sum(bases)/len(bases) if bases else 0.0,
+                "model_version":block[-1]["model_version"],
+            })
+        trend=(bins[0]["avg_log_loss"]-bins[-1]["avg_log_loss"]) if len(bins)>=2 else None
+        return {"bins":bins[-12:],"trend_log_loss_improvement":trend,
+                "improving":bool(trend is not None and trend>0.01),
+                "uniform_log_loss":UNIFORM_LOG_LOSS}
+
+    def temperature_calibration(self,limit=TEMP_CALIBRATION_LIMIT,model_version=None):
+        with self.lock,self.conn() as c:
+            if model_version:
+                rows=c.execute("""
+                    SELECT probs_json,actual FROM predictions
+                    WHERE resolved_at IS NOT NULL AND actual IS NOT NULL AND model_version=?
+                    ORDER BY rowid DESC LIMIT ?
+                """,(model_version,int(limit))).fetchall()
+            else:
+                rows=c.execute("""
+                    SELECT probs_json,actual FROM predictions
+                    WHERE resolved_at IS NOT NULL AND actual IS NOT NULL
+                    ORDER BY rowid DESC LIMIT ?
+                """,(int(limit),)).fetchall()
+        n=len(rows)
+        if n<TEMP_CALIBRATION_MIN:
+            return {"n":n,"ready":False,"temperature":1.0,"raw_log_loss":None,"best_log_loss":None,"improvement":0.0}
+        samples=[]
+        for r in rows:
+            try: samples.append((json.loads(r["probs_json"]),int(r["actual"])))
+            except Exception: pass
+        if len(samples)<TEMP_CALIBRATION_MIN:
+            return {"n":len(samples),"ready":False,"temperature":1.0,"raw_log_loss":None,"best_log_loss":None,"improvement":0.0}
+        candidates=[0.70,0.80,0.90,1.00,1.10,1.20,1.35,1.50,1.70,2.00]
+        def avg_loss(t):
+            return sum(logloss(temperature_scale(p,t),a) for p,a in samples)/len(samples)
+        scored=[(avg_loss(t),t) for t in candidates]
+        best_loss,best_t=min(scored)
+        raw=next(x[0] for x in scored if abs(x[1]-1.0)<1e-9)
+        # Só aplica se houver ganho mensurável; senão mantém 1.0.
+        use_t=best_t if best_loss < raw-0.002 else 1.0
+        use_loss=best_loss if use_t!=1.0 else raw
+        return {"n":len(samples),"ready":True,"temperature":use_t,"raw_log_loss":raw,
+                "best_log_loss":use_loss,"improvement":raw-use_loss}
+
+    def backup(self):
+        stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+        target=BACKUP_DIR/f"mega_ai_{stamp}.sqlite3"
+
+        with self.lock:
+            # Reduz WAL acumulado antes do backup.
+            try:
+                self.checkpoint("PASSIVE")
+            except Exception:
+                pass
+
+            src=self.conn()
+            dst=sqlite3.connect(target)
+            try:
+                src.backup(dst)
+                dst.commit()
+            finally:
+                dst.close()
+                src.close()
+
+        ok,msg=self._validate_path(target)
+        if not ok:
+            target.unlink(missing_ok=True)
+            raise sqlite3.DatabaseError(f"backup criado mas inválido: {msg}")
+
+        backups=sorted(BACKUP_DIR.glob("mega_ai_*.sqlite3"),reverse=True)
+        for old in backups[BACKUP_KEEP:]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+
+        return str(target)
+
+    def collector_state(self):
+        return self.get_state("collector_state", {}) or {}
+
+    def save_collector_state(self, value):
+        self.set_state("collector_state", value)
+
+# ============================================================
+# FEATURES / MODELOS
+# ============================================================
+
+def freq_probs(nums,window):
+    counts=[1.0]*37
+    for n in nums[-window:]:
+        counts[int(n)]+=1
+    return normalize(counts)
+
+def trans_probs(nums,window=600):
+    if not nums: return [UNIFORM_P]*37
+    last=int(nums[-1])
+    counts=[1.0]*37
+    seq=nums[-(window+1):]
+    for a,b in zip(seq[:-1],seq[1:]):
+        if int(a)==last: counts[int(b)]+=1
+    return normalize(counts)
+
+
+def global_empirical_probs(nums, window=3000):
+    data=nums[-window:] if nums else []
+    counts=[5.0]*37
+    for n in data: counts[int(n)]+=1.0
+    return normalize(counts)
+
+
+def puller_model(nums, source=None):
+    """Associações source -> target com Bayes, recência e contexto de 2 passos."""
+    if not nums:
+        return [UNIFORM_P]*37,{"source":None,"source_support":0,"pair_support":0,"reliability":0.0,"top":[]}
+
+    source=int(nums[-1] if source is None else source)
+    baseline=global_empirical_probs(nums,min(PULLER_LONG_WINDOW,max(37,len(nums))))
+    alpha=PULLER_PRIOR_ALPHA
+
+    seq=nums[-(PULLER_LONG_WINDOW+1):]
+    long_counts=[0.0]*37; source_support=0
+    for a,b in zip(seq[:-1],seq[1:]):
+        if int(a)==source:
+            long_counts[int(b)]+=1.0; source_support+=1
+    long_den=source_support+37.0*alpha
+    long_p=[(long_counts[t]+alpha)/long_den if long_den>0 else UNIFORM_P for t in range(37)]
+
+    recent=nums[-(PULLER_RECENT_WINDOW+1):]
+    recent_counts=[0.0]*37; recent_support=0.0
+    for age,(a,b) in enumerate(reversed(list(zip(recent[:-1],recent[1:])))):
+        if int(a)!=source: continue
+        w=PULLER_RECENCY_DECAY**age
+        recent_counts[int(b)]+=w; recent_support+=w
+    recent_den=recent_support+37.0*alpha
+    recent_p=[(recent_counts[t]+alpha)/recent_den if recent_den>0 else UNIFORM_P for t in range(37)]
+
+    previous=int(nums[-2]) if len(nums)>=2 else None
+    pair_counts=[0.0]*37; pair_support=0
+    if previous is not None:
+        pseq=nums[-(PULLER_PAIR_WINDOW+2):]
+        for i in range(len(pseq)-2):
+            if int(pseq[i])==previous and int(pseq[i+1])==source:
+                pair_counts[int(pseq[i+2])]+=1.0; pair_support+=1
+    pair_den=pair_support+37.0*alpha
+    pair_p=[(pair_counts[t]+alpha)/pair_den if pair_den>0 else UNIFORM_P for t in range(37)]
+
+    long_conf=1.0-math.exp(-source_support/12.0)
+    recent_conf=1.0-math.exp(-recent_support/7.0)
+    pair_conf=1.0-math.exp(-pair_support/5.0)
+    reliability=clamp(0.62*long_conf+0.25*recent_conf+0.13*pair_conf,0,1)
+
+    raw=[]; details=[]
+    for t in range(37):
+        base=max(baseline[t],1e-9)
+        ll=long_p[t]/base; rl=recent_p[t]/base; pl=pair_p[t]/base
+        evidence=(0.56*long_conf*math.log(clamp(ll,0.35,3.5))+
+                  0.29*recent_conf*math.log(clamp(rl,0.35,4.0))+
+                  0.15*pair_conf*math.log(clamp(pl,0.35,4.5)))
+        raw.append(base*math.exp(clamp(evidence,-0.70,0.70)))
+        expected=max(source_support*base,1e-6)
+        z=(long_counts[t]-expected)/math.sqrt(max(expected*(1-base),0.25))
+        strength=100*clamp(0.34*clamp((ll-1)/1.2,0,1)+0.24*clamp((rl-1)/1.4,0,1)+
+                           0.14*clamp((pl-1)/1.6,0,1)+0.18*long_conf+0.10*clamp((z-.5)/2.5,0,1),0,1)
+        details.append({"target":t,"count":int(long_counts[t]),"source_support":source_support,
+                        "recent_weighted_count":round(recent_counts[t],3),"recent_support":round(recent_support,3),
+                        "pair_count":int(pair_counts[t]),"pair_support":pair_support,
+                        "posterior_pct":round(100*long_p[t],3),"long_lift":round(ll,3),
+                        "recent_lift":round(rl,3),"pair_lift":round(pl,3),"z":round(z,3),
+                        "strength":round(strength,1),"zone":neighbors(t,2)})
+    probs=normalize(raw)
+    for d in details: d["model_probability_pct"]=round(100*probs[d["target"]],3)
+    details.sort(key=lambda d:(d["strength"],d["model_probability_pct"],d["count"]),reverse=True)
+    shown=[d for d in details[:10] if d["strength"]>=PULLER_MIN_DISPLAY_STRENGTH] or details[:5]
+    return probs,{"source":source,"previous":previous,"source_support":source_support,
+                  "recent_support":round(recent_support,3),"pair_support":pair_support,
+                  "reliability":round(reliability,4),"enough_support":source_support>=PULLER_MIN_SOURCE_SUPPORT,
+                  "strong_support":source_support>=PULLER_STRONG_SOURCE_SUPPORT,"top":shown}
+
+
+def strongest_puller_relations(nums, limit=12):
+    if len(nums)<80: return []
+    rows=[]
+    for source in range(37):
+        seq=list(nums)
+        if not seq or seq[-1]!=source: seq=seq+[source]
+        _,rep=puller_model(seq,source=source)
+        if rep["source_support"]<PULLER_MIN_SOURCE_SUPPORT: continue
+        for item in rep["top"][:3]:
+            rows.append({"source":source,"target":item["target"],"strength":item["strength"],
+                         "lift":item["long_lift"],"count":item["count"],"support":rep["source_support"]})
+    rows.sort(key=lambda x:(x["strength"],x["count"],x["lift"]),reverse=True)
+    return rows[:limit]
+
+
+def wilson_lower(hits,n,z=1.2816):
+    if n<=0: return 0.0
+    p=hits/n
+    den=1+(z*z/n)
+    center=p+(z*z/(2*n))
+    margin=z*math.sqrt((p*(1-p)+z*z/(4*n))/n)
+    return max(0.0,(center-margin)/den)
+
+
+def source_local_validation(nums,source=None,max_events=None):
+    """Replay walk-forward apenas quando o MESMO número-fonte apareceu."""
+    if not nums:
+        return {"source":None,"n":0,"top1_pct":0.0,"top3_pct":0.0,"top5_pct":0.0,
+                "top5_lower_pct":0.0,"avg_log_loss":None,"skill":0.0,
+                "enough_data":False,"recent_top5_pct":0.0}
+
+    source=int(nums[-1] if source is None else source)
+    max_events=max_events or ROUND_LOCAL_MAX_EVENTS
+    idxs=[i for i in range(45,len(nums)-1) if int(nums[i])==source][-max_events:]
+
+    t1=t3=t5=0
+    losses=[]
+    recent=[]
+
+    for i in idxs:
+        before=nums[:i+1]
+        actual=int(nums[i+1])
+        p,rep=puller_model(before,source=source)
+        if rep.get("source_support",0)<3:
+            continue
+        rank=topk(p,5)
+        h1=int(actual in rank[:1]); h3=int(actual in rank[:3]); h5=int(actual in rank[:5])
+        t1+=h1; t3+=h3; t5+=h5
+        recent.append(h5)
+        losses.append(logloss(p,actual))
+
+    n=len(losses)
+    if not n:
+        return {"source":source,"n":0,"top1_pct":0.0,"top3_pct":0.0,"top5_pct":0.0,
+                "top5_lower_pct":0.0,"avg_log_loss":None,"skill":0.0,
+                "enough_data":False,"recent_top5_pct":0.0}
+
+    top5=t5/n
+    ll=sum(losses)/n
+    ll_skill=clamp((UNIFORM_LOG_LOSS-ll)/0.22,0,1)
+    top5_skill=clamp((top5-(5/37))/0.12,0,1)
+    shrink=n/(n+18.0)
+    skill=shrink*(0.58*ll_skill+0.42*top5_skill)
+    rr=recent[-20:]
+
+    return {
+        "source":source,"n":n,
+        "top1_pct":100*t1/n,"top3_pct":100*t3/n,"top5_pct":100*top5,
+        "top5_lower_pct":100*wilson_lower(t5,n),
+        "top5_baseline_pct":100*(5/37),
+        "recent_top5_pct":100*(sum(rr)/len(rr)) if rr else 0.0,
+        "avg_log_loss":ll,"uniform_log_loss":UNIFORM_LOG_LOSS,
+        "skill":clamp(skill,0,1),
+        "enough_data":n>=ROUND_LOCAL_MIN_EVENTS,
+    }
+
+
+def pair_context_report(nums):
+    if len(nums)<2:
+        return {"previous":None,"source":None,"support":0,"top":[]}
+    previous=int(nums[-2]); source=int(nums[-1])
+    counts=[0]*37; support=0
+    seq=nums[-(PULLER_PAIR_WINDOW+2):]
+    for i in range(len(seq)-2):
+        if int(seq[i])==previous and int(seq[i+1])==source:
+            counts[int(seq[i+2])]+=1; support+=1
+    den=support+37.0
+    p=[(c+1.0)/den for c in counts]
+    rank=topk(p,6)
+    return {"previous":previous,"source":source,"support":support,
+            "top":[{"number":n,"count":counts[n],"pct":100*p[n]} for n in rank]}
+
+
+def cluster_context_report(nums):
+    if not nums:
+        return {"source":None,"zone":[],"recent_hits":0,"recent_n":0,"recent_pct":0.0,"fair_pct":0.0}
+    source=int(nums[-1]); zone=set(neighbors(source,2)); recent=nums[-30:]
+    hits=sum(int(n) in zone for n in recent)
+    return {"source":source,"zone":neighbors(source,2),"recent_hits":hits,
+            "recent_n":len(recent),"recent_pct":100*hits/len(recent) if recent else 0.0,
+            "fair_pct":100*len(zone)/37}
+
+
+def cluster_probs(nums,window=220):
+    counts=[0.35]*37
+    for age,n in enumerate(reversed(nums[-window:])):
+        w=0.995**age
+        for x in neighbors(n,2): counts[x]+=w
+    return normalize(counts)
+
+def terminal_probs(nums,window=300):
+    t=[1.0]*10
+    for n in nums[-window:]: t[terminal(n)]+=1
+    total=sum(t)
+    p=[0.0]*37
+    for n in range(37):
+        group=[x for x in range(37) if terminal(x)==terminal(n)]
+        p[n]=(t[terminal(n)]/total)/len(group)
+    return normalize(p)
+
+def sector_probs(nums,window=250):
+    groups={"voisins":VOISINS,"tiers":TIERS,"orphelins":ORPHELINS}
+    cnt={k:1.0 for k in groups}
+    for n in nums[-window:]: cnt[sector(n)]+=1
+    total=sum(cnt.values())
+    p=[0.0]*37
+    for n in range(37):
+        s=sector(n)
+        p[n]=(cnt[s]/total)/len(groups[s])
+    return normalize(p)
+
+def gap(nums,c,cap=180):
+    g=0
+    for n in reversed(nums[-cap:]):
+        if int(n)==c: break
+        g+=1
+    else: g=cap
+    return clamp(g/cap,0,1)
+
+def rel(p):
+    return clamp((p/UNIFORM_P-1)/2,-1,1)
+
+def feature_matrix(nums):
+    pull_probs,_pull_report=puller_model(nums)
+    ps=[
+        pull_probs,freq_probs(nums,20),freq_probs(nums,50),
+        freq_probs(nums,100),freq_probs(nums,300),freq_probs(nums,1000),
+        cluster_probs(nums),terminal_probs(nums),sector_probs(nums)
+    ]
+    last=int(nums[-1]) if nums else None
+    rows=[]
+    for c in range(37):
+        if last is None:
+            near=samet=samec=samed=0
+        else:
+            near=1-wheel_distance(last,c)/18
+            samet=1 if terminal(last)==terminal(c) else 0
+            samec=1 if last!=0 and c!=0 and color(last)==color(c) else 0
+            samed=1 if dozen(last)!=0 and dozen(last)==dozen(c) else 0
+        rows.append([
+            1.0,rel(ps[0][c]),rel(ps[1][c]),rel(ps[2][c]),rel(ps[3][c]),
+            rel(ps[4][c]),rel(ps[5][c]),rel(ps[6][c]),rel(ps[7][c]),
+            gap(nums,c),near,samet,samec,samed,rel(ps[8][c])
+        ])
+    return rows
+
+def classical_probs(nums):
+    models=[
+        (trans_probs(nums),.10),(freq_probs(nums,20),.10),(freq_probs(nums,50),.11),
+        (freq_probs(nums,100),.13),(freq_probs(nums,300),.11),(freq_probs(nums,1000),.09),
+        (cluster_probs(nums),.20),(terminal_probs(nums),.08),(sector_probs(nums),.08)
+    ]
+    out=[0.0]*37
+    for p,w in models:
+        for i in range(37): out[i]+=p[i]*w
+    return normalize(out)
+
+def window_agreement(nums):
+    sets=[]
+    for w in (20,50,100,300,1000):
+        if len(nums)>=20: sets.append(set(topk(freq_probs(nums,min(w,len(nums))),8)))
+    if len(sets)<2: return 0
+    vals=[]
+    for i in range(len(sets)):
+        for j in range(i+1,len(sets)):
+            vals.append(len(sets[i]&sets[j])/max(1,len(sets[i]|sets[j])))
+    return sum(vals)/len(vals)
+
+# ============================================================
+# VALIDADOR WALK-FORWARD DOS PUXADORES
+# ============================================================
+
+class PullerValidator:
+    KEY="puller_validator_v1"
+    def __init__(self,db):
+        self.db=db; st=db.get_state(self.KEY,{}) or {}
+        self.samples=int(st.get("samples",0)); self.t1=int(st.get("t1",0)); self.t3=int(st.get("t3",0)); self.t5=int(st.get("t5",0))
+        self.loss=float(st.get("loss",0.0)); self.bs=float(st.get("brier",0.0)); self.lock=threading.RLock()
+        self.bootstrap_samples=int(st.get("bootstrap_samples",0))
+    def save(self):
+        self.db.set_state(self.KEY,{"samples":self.samples,"t1":self.t1,"t3":self.t3,"t5":self.t5,"loss":self.loss,"brier":self.bs,"bootstrap_samples":self.bootstrap_samples})
+    def bootstrap(self,nums):
+        """Replay walk-forward, sem futuro, apenas quando ainda não há estado do validador."""
+        if self.samples>0 or len(nums)<80:
+            return 0
+        start=max(60,len(nums)-PULLER_BOOTSTRAP_POINTS)
+        before=self.samples
+        for i in range(start,len(nums)):
+            self.evaluate(nums[:i],int(nums[i]))
+        self.bootstrap_samples=self.samples-before
+        self.save()
+        return self.bootstrap_samples
+    def evaluate(self,nums_before,actual):
+        if len(nums_before)<30: return
+        p,rep=puller_model(nums_before)
+        if rep["source_support"]<2: return
+        rank=topk(p,5); actual=int(actual)
+        with self.lock:
+            self.samples+=1; self.t1+=int(actual in rank[:1]); self.t3+=int(actual in rank[:3]); self.t5+=int(actual in rank)
+            self.loss+=logloss(p,actual); self.bs+=brier(p,actual)
+            if self.samples%5==0: self.save()
+    def metrics(self):
+        n=self.samples; ll=self.loss/n if n else None
+        skill=clamp((UNIFORM_LOG_LOSS-ll)/0.22,0,1) if n>=PULLER_SKILL_MIN_SAMPLES and ll is not None else 0.0
+        return {"samples":n,"ready":n>=PULLER_SKILL_MIN_SAMPLES,
+                "top1_pct":100*self.t1/n if n else 0.0,"top3_pct":100*self.t3/n if n else 0.0,
+                "top5_pct":100*self.t5/n if n else 0.0,"avg_log_loss":ll,"avg_brier":self.bs/n if n else None,
+                "skill":skill,"uniform_log_loss":UNIFORM_LOG_LOSS,"bootstrap_samples":self.bootstrap_samples}
+
+# ============================================================
+# ENSEMBLE ADAPTATIVO: cada modelo ganha/perde peso por desempenho real
+# ============================================================
+
+class ModelPerformanceTracker:
+    KEY="professional_model_tracker_v2"
+    OLD_KEY="adaptive_model_tracker_v1"
+
+    def __init__(self,db):
+        self.db=db
+        st=db.get_state(self.KEY,{}) or {}
+        self.stats=st.get("stats",{}) if isinstance(st.get("stats",{}),dict) else {}
+        self.regimes=st.get("regimes",{}) if isinstance(st.get("regimes",{}),dict) else {}
+        self.lock=threading.RLock()
+
+        if not self.stats:
+            old=db.get_state(self.OLD_KEY,{}) or {}
+            oldstats=old.get("stats",{}) if isinstance(old.get("stats",{}),dict) else {}
+            for name,v in oldstats.items():
+                ll=v.get("ema_log_loss")
+                br=v.get("ema_brier")
+                t5=v.get("ema_top5")
+                self.stats[name]={
+                    "n":int(v.get("n",0)),
+                    "fast_ll":ll,"slow_ll":ll,
+                    "fast_brier":br,"slow_brier":br,
+                    "fast_top5":t5,"slow_top5":t5,
+                }
+        for name in MODEL_PRIORS:
+            self.stats.setdefault(name,self._blank())
+
+    @staticmethod
+    def _blank():
+        return {"n":0,"fast_ll":None,"slow_ll":None,
+                "fast_brier":None,"slow_brier":None,
+                "fast_top5":None,"slow_top5":None}
+
+    def save(self):
+        self.db.set_state(self.KEY,{"stats":self.stats,"regimes":self.regimes})
+
+    def _update(self,st,ll,br,h):
+        st["n"]=int(st.get("n",0))+1
+        for key,val,alpha in (
+            ("fast_ll",ll,PRO_MODEL_FAST_ALPHA),
+            ("slow_ll",ll,PRO_MODEL_SLOW_ALPHA),
+            ("fast_brier",br,PRO_MODEL_FAST_ALPHA),
+            ("slow_brier",br,PRO_MODEL_SLOW_ALPHA),
+            ("fast_top5",h,PRO_MODEL_FAST_ALPHA),
+            ("slow_top5",h,PRO_MODEL_SLOW_ALPHA),
+        ):
+            old=st.get(key)
+            st[key]=float(val) if old is None else (1-alpha)*float(old)+alpha*float(val)
+
+    def evaluate(self,nums_before,actual,ai):
+        if len(nums_before)<30:
+            return
+        ai_probs,_=ai.predict(nums_before)
+        models=independent_models(nums_before,ai_probs)
+        regime=regime_analysis(nums_before).get("level","WARMUP")
+        actual=int(actual)
+
+        with self.lock:
+            rb=self.regimes.setdefault(regime,{})
+            for name,p in models.items():
+                ll=logloss(p,actual)
+                br=brier(p,actual)
+                h=float(actual in topk(p,5))
+                gs=self.stats.setdefault(name,self._blank())
+                rs=rb.setdefault(name,self._blank())
+                self._update(gs,ll,br,h)
+                self._update(rs,ll,br,h)
+            if max(int(v.get("n",0)) for v in self.stats.values())%5==0:
+                self.save()
+
+    def _combined(self,name,regime=None):
+        g=self.stats.get(name,self._blank())
+        r=(self.regimes.get(regime,{}) or {}).get(name,self._blank()) if regime else self._blank()
+
+        def mv(field):
+            gv=g.get(field)
+            rv=r.get(field)
+            if gv is None:
+                return rv
+            if rv is None or not regime:
+                return gv
+            rc=clamp(int(r.get("n",0))/max(1,PRO_REGIME_MIN_SAMPLES),0,1)
+            return (1-0.70*rc)*float(gv)+(0.70*rc)*float(rv)
+
+        return {"n":int(g.get("n",0)),
+                "regime_n":int(r.get("n",0)) if regime else 0,
+                "fast_ll":mv("fast_ll"),"slow_ll":mv("slow_ll"),
+                "fast_brier":mv("fast_brier"),"slow_brier":mv("slow_brier"),
+                "fast_top5":mv("fast_top5"),"slow_top5":mv("slow_top5")}
+
+    def weights(self,regime=None):
+        scores={}
+        for name,prior in MODEL_PRIORS.items():
+            st=self._combined(name,regime)
+            n=int(st["n"])
+            conf=clamp(n/max(1,MODEL_WEIGHT_MIN_SAMPLES),0,1)
+            fast,slow=st["fast_ll"],st["slow_ll"]
+
+            if fast is None and slow is None:
+                scores[name]=max(PRO_WEIGHT_FLOOR,float(prior))
+                continue
+            if fast is None: fast=slow
+            if slow is None: slow=fast
+
+            mixed=0.65*float(slow)+0.35*float(fast)
+            skill=clamp((UNIFORM_LOG_LOSS-mixed)/MODEL_WEIGHT_TAU,-1.25,1.25)
+            ft,st5=st["fast_top5"],st["slow_top5"]
+            if ft is None and st5 is None:
+                top_edge=0.0
+            else:
+                if ft is None: ft=st5
+                if st5 is None: st5=ft
+                top_edge=(0.40*float(ft)+0.60*float(st5))-(5/37)
+
+            stability=math.exp(-abs(float(fast)-float(slow))/0.20)
+            perf=math.exp(clamp(skill,-1.1,1.1))
+            top_adj=1.0+clamp(top_edge/0.10,-0.30,0.30)
+            learned=float(prior)*perf*top_adj*(0.75+0.25*stability)
+            scores[name]=max(PRO_WEIGHT_FLOOR,float(prior)*(1-conf)+learned*conf)
+
+        total=sum(scores.values()) or 1.0
+        return {k:v/total for k,v in scores.items()}
+
+    def metrics(self,regime=None):
+        weights=self.weights(regime)
+        out={}
+        for name in MODEL_PRIORS:
+            st=self._combined(name,regime)
+            fast,slow=st["fast_ll"],st["slow_ll"]
+            if fast is None and slow is None:
+                mixed=None
+            else:
+                if fast is None: fast=slow
+                if slow is None: slow=fast
+                mixed=0.65*float(slow)+0.35*float(fast)
+
+            out[name]={
+                "n":int(st["n"]),"regime_n":int(st["regime_n"]),
+                "fast_log_loss":st["fast_ll"],"slow_log_loss":st["slow_ll"],
+                "mixed_log_loss":mixed,
+                "fast_top5_pct":100*float(st["fast_top5"] or 0),
+                "slow_top5_pct":100*float(st["slow_top5"] or 0),
+                "weight_pct":100*weights.get(name,0),
+                "beats_uniform":bool(mixed is not None and mixed<UNIFORM_LOG_LOSS),
+                "stable":bool(st["fast_ll"] is not None and st["slow_ll"] is not None
+                              and abs(float(st["fast_ll"])-float(st["slow_ll"]))<0.18),
+            }
+
+        mature=sum(1 for v in out.values() if v["n"]>=MODEL_WEIGHT_MIN_SAMPLES)
+        beating=sum(1 for v in out.values()
+                    if v["n"]>=MODEL_WEIGHT_MIN_SAMPLES and v["beats_uniform"])
+        return {"models":out,"weights":weights,"min_samples":MODEL_WEIGHT_MIN_SAMPLES,
+                "regime":regime,"mature_models":mature,
+                "models_beating_uniform":beating}
+
+
+def cap_and_renormalize(weights,name,cap):
+    weights=dict(weights)
+    if weights.get(name,0)<=cap: return weights
+    excess=weights[name]-cap; weights[name]=cap
+    others=[k for k in weights if k!=name]
+    base=sum(weights[k] for k in others)
+    if base>0:
+        for k in others: weights[k]+=excess*(weights[k]/base)
+    return weights
+
+# ============================================================
+# IA ONLINE EXPLICÁVEL
+# ============================================================
+
+class OnlineAI:
+    KEY="online_ai_v2_professional"
+    OLD_KEY="online_ai_v1"
+
+    def __init__(self,db):
+        self.db=db
+        state=db.get_state(self.KEY,{}) or {}
+        if not state:
+            state=db.get_state(self.OLD_KEY,{}) or {}
+
+        w=state.get("weights")
+        if not isinstance(w,list) or len(w)!=len(FEATURES):
+            w=[0.0]*len(FEATURES)
+            for name,val in {"transicao":.10,"freq50":.05,"freq100":.05,"cluster_roda":.08}.items():
+                w[FEATURES.index(name)]=val
+        self.weights=[float(x) for x in w]
+
+        gs=state.get("grad_sq")
+        if not isinstance(gs,list) or len(gs)!=len(FEATURES):
+            gs=[0.0]*len(FEATURES)
+        self.grad_sq=[max(0.0,float(x)) for x in gs]
+
+        self.samples=int(state.get("samples",0))
+        self.t1=int(state.get("t1",0))
+        self.t3=int(state.get("t3",0))
+        self.t5=int(state.get("t5",0))
+        self.loss=float(state.get("loss",0.0))
+        self.bs=float(state.get("brier",0.0))
+        self.fast_ll=state.get("fast_ll")
+        self.slow_ll=state.get("slow_ll")
+        self.fast_top5=state.get("fast_top5")
+        self.slow_top5=state.get("slow_top5")
+        self.lock=threading.RLock()
+
+    def save(self):
+        self.db.set_state(self.KEY,{
+            "weights":self.weights,"grad_sq":self.grad_sq,"samples":self.samples,
+            "t1":self.t1,"t3":self.t3,"t5":self.t5,"loss":self.loss,"brier":self.bs,
+            "fast_ll":self.fast_ll,"slow_ll":self.slow_ll,
+            "fast_top5":self.fast_top5,"slow_top5":self.slow_top5})
+
+    def probs_from_matrix(self,matrix,weights=None):
+        weights=self.weights if weights is None else weights
+        return softmax([sum(w*x for w,x in zip(weights,row)) for row in matrix])
+
+    def predict(self,nums):
+        m=feature_matrix(nums)
+        return self.probs_from_matrix(m),m
+
+    @staticmethod
+    def _ema(old,value,alpha):
+        return float(value) if old is None else (1-alpha)*float(old)+alpha*float(value)
+
+    def learn(self,nums_before,actual):
+        if len(nums_before)<10:
+            return
+        actual=int(actual)
+
+        with self.lock:
+            m=feature_matrix(nums_before)
+            p=self.probs_from_matrix(m)
+            rank=topk(p,5)
+            ll=logloss(p,actual)
+            br=brier(p,actual)
+            h5=float(actual in rank)
+
+            self.samples+=1
+            self.t1+=int(actual in rank[:1])
+            self.t3+=int(actual in rank[:3])
+            self.t5+=int(actual in rank)
+            self.loss+=ll
+            self.bs+=br
+
+            self.fast_ll=self._ema(self.fast_ll,ll,AI_FAST_ALPHA)
+            self.slow_ll=self._ema(self.slow_ll,ll,AI_SLOW_ALPHA)
+            self.fast_top5=self._ema(self.fast_top5,h5,AI_FAST_ALPHA)
+            self.slow_top5=self._ema(self.slow_top5,h5,AI_SLOW_ALPHA)
+
+            expected=[0.0]*len(self.weights)
+            mean_feature=[0.0]*len(self.weights)
+            for c in range(37):
+                for j,x in enumerate(m[c]):
+                    expected[j]+=p[c]*x
+                    mean_feature[j]+=x/37.0
+
+            smooth=AI_LABEL_SMOOTHING
+            target=[(1-smooth)*m[actual][j]+smooth*mean_feature[j]
+                    for j in range(len(self.weights))]
+
+            for j in range(len(self.weights)):
+                grad=expected[j]-target[j]+AI_L2*self.weights[j]
+                grad=clamp(grad,-AI_GRAD_CLIP,AI_GRAD_CLIP)
+                self.grad_sq[j]+=grad*grad
+                step=AI_LR/math.sqrt(self.grad_sq[j]+AI_ADAGRAD_EPS)
+                self.weights[j]=clamp(self.weights[j]-step*grad,
+                                      -AI_WEIGHT_CLIP,AI_WEIGHT_CLIP)
+
+            if self.samples%5==0:
+                self.save()
+
+    def metrics(self):
+        n=self.samples
+        avg_ll=self.loss/n if n else None
+        fast,slow=self.fast_ll,self.slow_ll
+        if fast is None and slow is None:
+            pro_ll=avg_ll
+        else:
+            if fast is None: fast=slow
+            if slow is None: slow=fast
+            pro_ll=0.35*float(fast)+0.65*float(slow)
+
+        conf=clamp(n/max(1,AI_SKILL_MIN_SAMPLES),0,1)
+        skill=conf*clamp((UNIFORM_LOG_LOSS-float(pro_ll))/0.22,0,1) if pro_ll is not None else 0.0
+
+        return {
+            "samples":n,"ready":n>=AI_MIN_SAMPLES,
+            "top1_pct":100*self.t1/n if n else 0,
+            "top3_pct":100*self.t3/n if n else 0,
+            "top5_pct":100*self.t5/n if n else 0,
+            "avg_log_loss":avg_ll,"avg_brier":self.bs/n if n else None,
+            "fast_log_loss":self.fast_ll,"slow_log_loss":self.slow_ll,
+            "fast_top5_pct":100*float(self.fast_top5 or 0),
+            "slow_top5_pct":100*float(self.slow_top5 or 0),
+            "professional_skill":skill,
+            "weights":{FEATURES[i]:round(w,4) for i,w in enumerate(self.weights)}
+        }
+
+    @staticmethod
+    def explain(row,weights,topn=5):
+        items=[]
+        for name,x,w in zip(FEATURES,row,weights):
+            if name=="bias":
+                continue
+            c=float(x)*float(w)
+            items.append({"factor":name,"contribution":round(c,4),
+                          "direction":"favorece" if c>0 else "reduz" if c<0 else "neutro"})
+        items.sort(key=lambda z:abs(z["contribution"]),reverse=True)
+        return items[:topn]
+
+# ============================================================
+# GATILHO
+# ============================================================
+
+def choose_centers(probs,nums,ai,matrix,model_weights=None):
+    agreement=window_agreement(nums)
+    ai_probs=ai.probs_from_matrix(matrix)
+    models=independent_models(nums,ai_probs)
+    pull_probs,pull_report=puller_model(nums)
+
+    ranked=sorted(
+        range(37),
+        key=lambda n:(mass(probs,neighbors(n,2)),probs[n]),
+        reverse=True
+    )[:22]
+
+    info={}
+    for n in ranked:
+        zone=neighbors(n,2)
+        zp=mass(probs,zone)
+        base=len(set(zone))/37
+        lift=zp/base if base else 1
+        factors=OnlineAI.explain(matrix[n],ai.weights,5)
+        pos=sum(max(0,f["contribution"]) for f in factors)
+        consensus,consensus_details=consensus_for_center(n,models,model_weights)
+
+        pull_rank=topk(pull_probs,8)
+        pull_zone_lift=mass(pull_probs,zone)/(len(set(zone))/37)
+        pull_bonus=clamp(0.55*float(n in pull_rank)+0.45*clamp((pull_zone_lift-1.0)/0.35,0,1),0,1)*float(pull_report.get("reliability",0.0))
+        score=(
+            25*clamp((lift-.95)/.25,0,1)
+            +18*clamp(probs[n]/max(probs),0,1)
+            +17*clamp(agreement/.70,0,1)
+            +14*clamp(pos/.5,0,1)
+            +18*consensus
+            +8*pull_bonus
+        )
+        info[n]={
+            "center":n,
+            "score":round(clamp(score,0,100),1),
+            "zone_probability":zp,
+            "zone_lift":lift,
+            "ai_factors":factors,
+            "model_consensus":consensus,
+            "model_support":consensus_details,
+            "puller_zone_lift":round(pull_zone_lift,3),
+            "puller_support":pull_report.get("source_support",0),
+            "puller_reliability":pull_report.get("reliability",0.0),
+            "pulled_by_last":n in pull_rank,
+        }
+
+    chosen=[]; covered=set()
+    while len(chosen)<3:
+        best=None; obj=-1e9
+        for n in ranked:
+            if n in chosen: continue
+            z=set(neighbors(n,2))
+            overlap=len(z&covered)/5
+            cur=info[n]["score"] - 26*overlap
+            if cur>obj:
+                obj=cur; best=n
+        if best is None: break
+        chosen.append(best)
+        covered.update(neighbors(best,2))
+
+    zones={str(n):neighbors(n,2) for n in chosen}
+    coverage=sorted(set(x for z in zones.values() for x in z))
+    details=[info[n] for n in chosen]
+
+    overall_consensus=sum(d["model_consensus"] for d in details)/(len(details) or 1)
+    return chosen,zones,coverage,details,agreement,overall_consensus
+
+def make_signal(probs,nums,ai,matrix,metrics,calibration,model_weights=None):
+    centers,zones,coverage,details,agreement,model_consensus=choose_centers(probs,nums,ai,matrix,model_weights)
+    covp=mass(probs,coverage)
+    covbase=len(coverage)/37
+    covlift=covp/covbase if covbase else 1
+    top5=topk(probs,5)
+    top5lift=mass(probs,top5)/(5/37)
+    entropy=-sum(p*math.log(max(p,1e-12)) for p in probs)/math.log(37)
+    am=ai.metrics()
+    regime=regime_analysis(nums)
+
+    scores=[d["score"] for d in details]
+    center_ok=(
+        len(scores)==3
+        and scores[0]>=MIN_CENTER_1
+        and scores[1]>=MIN_CENTER_2
+        and scores[2]>=MIN_CENTER_3
+    )
+
+    # Calibração só vira gate depois de amostra suficiente.
+    calibration_ok=True
+    if calibration["n"]>=CALIBRATION_MIN_N:
+        calibration_ok=calibration["gap_pp"]>=-5.0 and calibration["ece"]<=12.0
+
+    quality=(
+        18*clamp((covlift-1)/.2,0,1)
+        +12*clamp((top5lift-1)/.3,0,1)
+        +15*clamp(agreement/.7,0,1)
+        +16*model_consensus
+        +12*clamp((1-entropy)/.2,0,1)
+        +15*(sum(scores)/300 if scores else 0)
+        +7*clamp(am["samples"]/AI_MIN_SAMPLES,0,1)
+        +5*(1-clamp(regime["tv"]/REGIME_BLOCK_TV,0,1))
+    )
+    quality=round(clamp(quality,0,100),1)
+
+    threshold=GREEN_SCORE+min(8,3*metrics["green_loss_streak"])
+    if metrics["green_count"]>=20 and metrics["green_hit_pct"]<metrics["green_baseline_pct"]:
+        threshold+=4
+    if calibration["n"]>=CALIBRATION_MIN_N and calibration["gap_pp"] < -3:
+        threshold+=2
+    if regime["level"]=="MUDANDO":
+        threshold+=2
+    threshold=round(clamp(threshold,GREEN_SCORE,98),1)
+
+    reasons=[]
+    if metrics["resolved"]<GREEN_MIN_RESOLVED:
+        reasons.append(f"histórico {metrics['resolved']}/{GREEN_MIN_RESOLVED}")
+    if am["samples"]<AI_MIN_SAMPLES:
+        reasons.append(f"IA aprendendo {am['samples']}/{AI_MIN_SAMPLES}")
+    if agreement<MIN_WINDOW_AGREEMENT:
+        reasons.append(f"consenso temporal baixo {agreement*100:.0f}%")
+    if model_consensus<MIN_MODEL_CONSENSUS:
+        reasons.append(f"modelos discordam {model_consensus*100:.0f}%")
+    if covlift<1.03:
+        reasons.append("cobertura pouco concentrada")
+    if top5lift<1.05:
+        reasons.append("TOP5 pouco concentrado")
+    if not center_ok:
+        reasons.append("um dos 3 centros está fraco")
+    if entropy>.985:
+        reasons.append("distribuição quase uniforme")
+    if metrics["green_loss_streak"]>MAX_GREEN_LOSS_STREAK:
+        reasons.append("bloqueio por perdas Green")
+    if regime["tv"]>=REGIME_BLOCK_TV:
+        reasons.append(f"regime mudou forte TV={regime['tv']:.2f}")
+    if not calibration_ok:
+        reasons.append("calibração recente não valida confiança")
+
+    green=(
+        metrics["resolved"]>=GREEN_MIN_RESOLVED
+        and am["samples"]>=AI_MIN_SAMPLES
+        and agreement>=MIN_WINDOW_AGREEMENT
+        and model_consensus>=MIN_MODEL_CONSENSUS
+        and covlift>=1.03
+        and top5lift>=1.05
+        and center_ok
+        and entropy<=.985
+        and metrics["green_loss_streak"]<=MAX_GREEN_LOSS_STREAK
+        and regime["tv"]<REGIME_BLOCK_TV
+        and calibration_ok
+        and quality>=threshold
+    )
+
+    if green:
+        if (
+            quality>=GREEN_ELITE_SCORE
+            and model_consensus>=.82
+            and agreement>=.62
+            and regime["tv"]<REGIME_WARN_TV
+        ):
+            signal="GREEN_ELITE"
+        elif quality>=GREEN_PLUS_SCORE and model_consensus>=.72:
+            signal="GREEN_PLUS"
+        else:
+            signal="GREEN"
+    elif quality>=YELLOW_SCORE and agreement>=.30:
+        signal="YELLOW"
+    else:
+        signal="RED"
+
+    budget=BANKROLL*(RISK_PCT/100)
+    need=len(coverage)*MIN_CHIP
+    if signal.startswith("GREEN") and need>budget:
+        signal="YELLOW"
+        reasons.append(f"stake mínima R$ {need:.2f} > orçamento R$ {budget:.2f}")
+
+    return {
+        "signal":signal,
+        "quality":quality,
+        "threshold":threshold,
+        "reason":" | ".join(reasons) if reasons else "todos os filtros de precisão atendidos",
+        "centers":centers,
+        "zones":zones,
+        "coverage":coverage,
+        "center_details":details,
+        "coverage_probability":covp,
+        "coverage_baseline":covbase,
+        "coverage_lift":covlift,
+        "window_agreement":agreement,
+        "model_consensus":model_consensus,
+        "entropy":entropy,
+        "regime":regime,
+        "calibration":calibration,
+        "stake_required":round(need,2),
+        "stake_budget":round(budget,2),
+    }
+
+def apply_professional_gate(sig,edge,tracker_metrics,ai_metrics,puller_metrics):
+    out=dict(sig)
+    original=str(out.get("signal","RED"))
+    reasons=[]
+    ge=(edge or {}).get("green",{}) or {}
+    mature=int((tracker_metrics or {}).get("mature_models",0))
+    beating=int((tracker_metrics or {}).get("models_beating_uniform",0))
+    n=int(ge.get("n",0))
+    z=float(ge.get("z_score",0.0))
+
+    grade=0.0
+    grade+=25*clamp(float(out.get("model_consensus",0)),0,1)
+    grade+=20*clamp(float(out.get("window_agreement",0))/0.70,0,1)
+    grade+=15*clamp(float(ai_metrics.get("professional_skill",0)),0,1)
+    grade+=10*clamp(float(puller_metrics.get("skill",0)),0,1)
+    grade+=15*clamp(beating/max(1,len(MODEL_PRIORS)),0,1)
+    grade+=15*(clamp((z+1)/2,0,1) if n>=PRO_EDGE_MIN_GREEN_N else 0.5)
+    grade=round(clamp(grade,0,100),1)
+
+    if original.startswith("GREEN"):
+        if n>=PRO_EDGE_MIN_GREEN_N and z<=PRO_EDGE_RED_Z:
+            out["signal"]="RED"
+            reasons.append(f"bloqueio OOS: Greens abaixo do esperado (z={z:.2f})")
+        elif n>=PRO_EDGE_MIN_GREEN_N and z<PRO_EDGE_YELLOW_Z:
+            out["signal"]="YELLOW"
+            reasons.append(f"Green rebaixado por evidência OOS fraca (z={z:.2f})")
+        elif original=="GREEN_ELITE" and (n<PRO_EDGE_MIN_GREEN_N or z<PRO_ELITE_MIN_Z):
+            out["signal"]="GREEN_PLUS" if float(out.get("quality",0))>=GREEN_PLUS_SCORE else "GREEN"
+            reasons.append("Elite rebaixado: evidência OOS ainda insuficiente")
+
+        if (str(out.get("signal","")).startswith("GREEN")
+            and mature>=PRO_MIN_TRACKED_MODELS
+            and beating<PRO_MIN_MODELS_BEATING_UNIFORM):
+            out["signal"]="YELLOW"
+            reasons.append(f"modelos maduros sem vantagem validada ({beating}/{mature})")
+
+    decision="APROVADA" if str(out.get("signal","")).startswith("GREEN") else \
+             "OBSERVAR" if out.get("signal")=="YELLOW" else "REJEITADA"
+
+    if reasons:
+        out["reason"]=(str(out.get("reason") or "")+" | "+" | ".join(reasons)).strip(" |")
+
+    report={
+        "decision":decision,"grade":grade,"original_signal":original,
+        "final_signal":out.get("signal"),"downgraded":out.get("signal")!=original,
+        "reasons":reasons,"green_evidence":ge,
+        "mature_models":mature,"models_beating_uniform":beating,
+        "ai_professional_skill_pct":100*float(ai_metrics.get("professional_skill",0)),
+        "puller_skill_pct":100*float(puller_metrics.get("skill",0)),
+        "note":"Nota profissional é evidência/qualidade, não probabilidade de ganhar."
+    }
+    return out,report
+
+# ============================================================
+# ENGINE / COLETA
+# ============================================================
+
+class Engine:
+    def __init__(self,db):
+        self.db=db
+        self.ai=OnlineAI(db)
+        self.puller=PullerValidator(db)
+        self.model_tracker=ModelPerformanceTracker(db)
+        self.history=db.spins(HISTORY_LIMIT)
+        if self.puller.samples==0 and len(self.history)>=80:
+            try:
+                n_boot=self.puller.bootstrap([int(x["number"]) for x in self.history])
+                if n_boot:
+                    log.info("Puxadores: replay walk-forward inicial com %s previsões",n_boot)
+            except Exception:
+                log.exception("Falha no bootstrap dos puxadores")
+        self.lock=threading.RLock()
+        self.collector_running=False
+        self.last_error=""
+        self.last_fetch=None
+        self.last_success=None
+        self.last_latency_ms=None
+        self.consecutive_errors=0
+        self.network_state="INICIANDO"
+        self.stop_event=threading.Event()
+
+        # V3.1 Cloud 24x7
+        self.last_deep_sync_monotonic=0.0
+        self.last_backfill_pages=0
+        self.last_backfill_new=0
+        self.collector_restarts=0
+        self.booted_at=now_iso()
+
+        persisted=self.db.collector_state()
+        self.last_success=persisted.get("last_success") or self.last_success
+
+        self.session=requests.Session()
+        retry=Retry(
+            total=HTTP_RETRIES,
+            connect=HTTP_RETRIES,
+            read=HTTP_RETRIES,
+            status=HTTP_RETRIES,
+            backoff_factor=0.45,
+            status_forcelist=(429,500,502,503,504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        adapter=HTTPAdapter(max_retries=retry,pool_connections=2,pool_maxsize=4)
+        self.session.mount("https://",adapter)
+        self.session.mount("http://",adapter)
+
+    def nums(self): return [int(x["number"]) for x in self.history]
+
+    def parse(self,payload):
+        if not isinstance(payload,list): raise ValueError("API não retornou lista JSON")
+        out=[]
+        for item in payload:
+            try:
+                data=item["data"]
+                result=data["result"]
+                num=int(result["outcome"]["number"])
+                if 0<=num<=36:
+                    lucky=[]
+                    for x in result.get("luckyNumbersList",[]) or []:
+                        try:
+                            lucky.append({
+                                "number":int(x.get("number")),
+                                "roundedMultiplier":int(x.get("roundedMultiplier",0) or 0),
+                            })
+                        except Exception:
+                            pass
+                    table=data.get("table") or {}
+                    out.append({
+                        "id":str(item["id"]),
+                        "number":num,
+                        "settledAt":data.get("settledAt"),
+                        "luckyNumbers":lucky,
+                        "tableName":table.get("name","Mega Roulette"),
+                        "gameType":data.get("gameType","megaroulette"),
+                    })
+            except Exception:
+                continue
+        return out
+
+    def fetch(self, deep=False):
+        """
+        Coleta normal: página 0.
+        Deep sync: pagina para trás até reencontrar um round já salvo.
+        Isso permite recuperar lacunas automaticamente após queda/restart.
+        """
+        recovering=self.consecutive_errors>0
+        low_history=self.db.count_spins()<GREEN_MIN_RESOLVED
+        deep=bool(deep or recovering or low_history)
+
+        max_pages=MAX_BACKFILL_PAGES if deep else 1
+        records={}
+        started=time.monotonic()
+        pages_used=0
+        found_known=False
+
+        for page in range(max_pages):
+            url=url_for_page(page)
+            r=self.session.get(
+                url,
+                timeout=(CONNECT_TIMEOUT,READ_TIMEOUT),
+                headers={
+                    "User-Agent":"Mozilla/5.0 MegaRouletteAI-Cloud-24x7",
+                    "Accept":"application/json,text/plain,*/*",
+                    "Connection":"keep-alive",
+                }
+            )
+            r.raise_for_status()
+            parsed=self.parse(r.json())
+            pages_used+=1
+
+            if not parsed:
+                break
+
+            # Se encontramos um round já salvo, chegamos à parte conhecida.
+            page_has_known=False
+            for rec in parsed:
+                if self.db.has_spin(rec["id"]):
+                    page_has_known=True
+                records[rec["id"]]=rec
+
+            if deep and page_has_known:
+                found_known=True
+                break
+
+            if not deep:
+                break
+
+        items=sorted(
+            records.values(),
+            key=lambda x:(x.get("settledAt") or "",x["id"])
+        )
+
+        new=0
+        for rec in items:
+            if not self.db.has_spin(rec["id"]):
+                self.process_spin(rec)
+                new+=1
+
+        self.last_latency_ms=round((time.monotonic()-started)*1000)
+        self.last_fetch=now_iso()
+        self.last_success=self.last_fetch
+        self.last_error=""
+        self.network_state="ONLINE"
+        self.consecutive_errors=0
+        self.last_backfill_pages=pages_used
+        self.last_backfill_new=new
+
+        if deep:
+            self.last_deep_sync_monotonic=time.monotonic()
+
+        self.db.save_collector_state({
+            "last_success":self.last_success,
+            "last_fetch":self.last_fetch,
+            "last_round_id":self.history[-1]["id"] if self.history else None,
+            "last_number":self.history[-1]["number"] if self.history else None,
+            "last_backfill_pages":pages_used,
+            "last_backfill_new":new,
+            "deep":deep,
+            "found_known_round":found_known,
+            "cloud_mode":CLOUD_MODE,
+        })
+
+        if self.history:
+            self.ensure_prediction()
+
+        return new
+
+    def process_spin(self,rec):
+        if self.history:
+            prev=self.history[-1]
+            old=self.db.unresolved(prev["id"])
+            if old:
+                try:
+                    fm=json.loads(old["features_json"]); weights=json.loads(old["weights_json"])
+                    explanation=OnlineAI.explain(fm[int(rec["number"])],weights,6)
+                    self.db.resolve(prev["id"],rec["id"],int(rec["number"]),explanation)
+                except Exception:
+                    log.exception("Erro ao resolver previsão")
+            try:
+                self.model_tracker.evaluate(self.nums(),int(rec["number"]),self.ai)
+            except Exception:
+                log.exception("Erro ao validar ensemble adaptativo")
+            try:
+                self.puller.evaluate(self.nums(),int(rec["number"]))
+            except Exception:
+                log.exception("Erro ao validar puxadores")
+            try:
+                self.ai.learn(self.nums(),int(rec["number"]))
+            except Exception:
+                log.exception("Erro no aprendizado")
+
+        if self.db.insert_spin(rec):
+            self.history.append(rec)
+            if len(self.history)>HISTORY_LIMIT: self.history=self.history[-HISTORY_LIMIT:]
+            self.ensure_prediction()
+
+    def ensemble(self):
+        nums=self.nums()
+        aip,matrix=self.ai.predict(nums)
+        am=self.ai.metrics()
+        ai_ready=clamp(self.ai.samples/AI_MIN_SAMPLES,0,1)
+        if self.ai.samples<AI_SKILL_MIN_SAMPLES:
+            ai_skill=0.10*ai_ready
+        else:
+            ai_skill=float(am.get("professional_skill",0.0))
+
+        models=independent_models(nums,aip)
+        current_regime=regime_analysis(nums).get("level","WARMUP")
+        weights=self.model_tracker.weights(current_regime)
+
+        # Ajuste local da rodada para IA.
+        ai_top=set(topk(aip,8))
+        non_ai=[p for name,p in models.items() if name!="ia_online"]
+        base_consensus=normalize([sum(p[i] for p in non_ai)/len(non_ai) for i in range(37)])
+        base_top=set(topk(base_consensus,8))
+        ai_alignment=len(ai_top&base_top)/max(1,len(ai_top|base_top))
+        ai_local=clamp((0.20+0.80*ai_ready)*(0.25+0.75*ai_skill)*(0.55+0.90*ai_alignment),0.05,1.20)
+        weights["ia_online"]*=ai_local
+
+        # Ajuste local dos puxadores: suporte + skill global + skill específico do número atual.
+        pp,p_report=puller_model(nums)
+        local=source_local_validation(nums)
+        pm=self.puller.metrics()
+        global_pull_skill=float(pm.get("skill",0.0)) if self.puller.samples>=PULLER_SKILL_MIN_SAMPLES else 0.08*clamp(self.puller.samples/max(1,PULLER_SKILL_MIN_SAMPLES),0,1)
+        local_n=int(local.get("n",0)); local_skill=float(local.get("skill",0.0))
+        local_conf=clamp(local_n/max(1,ROUND_LOCAL_MIN_EVENTS),0,1)
+        pull_local=clamp(float(p_report.get("reliability",0.0))*(0.20+0.80*global_pull_skill)*(0.20+0.80*local_conf*local_skill),0.03,1.20)
+        weights["puxadores_bayes"]*=pull_local
+
+        # Renormaliza e respeita tetos.
+        total=sum(weights.values()) or 1.0
+        weights={k:v/total for k,v in weights.items()}
+        weights=cap_and_renormalize(weights,"ia_online",AI_MAX_BLEND)
+        weights=cap_and_renormalize(weights,"puxadores_bayes",PULLER_MAX_BLEND)
+        total=sum(weights.values()) or 1.0
+        weights={k:v/total for k,v in weights.items()}
+
+        raw=normalize([sum(weights[name]*models[name][i] for name in models) for i in range(37)])
+        temp=self.db.temperature_calibration(TEMP_CALIBRATION_LIMIT,APP_VERSION)
+        probs=temperature_scale(raw,temp.get("temperature",1.0))
+
+        round_meta={
+            "ai_alignment":ai_alignment,
+            "ai_round_factor":ai_local,
+            "local_puller":local,
+            "pair_context":pair_context_report(nums),
+            "cluster_context":cluster_context_report(nums),
+            "model_weights":weights,
+            "model_tracker":self.model_tracker.metrics(current_regime),
+            "current_regime":current_regime,
+            "temperature":temp,
+        }
+        return probs,matrix,weights.get("ia_online",0.0),ai_skill,weights.get("puxadores_bayes",0.0),global_pull_skill,p_report,round_meta
+
+    def build_round_analysis(self,probs,sig,puller_report,round_meta,
+                             ai_weight,ai_skill,puller_weight,puller_skill):
+        nums=self.nums()
+        source=int(nums[-1]) if nums else None
+        previous=int(nums[-2]) if len(nums)>=2 else None
+        local=round_meta.get("local_puller",{})
+        pair=round_meta.get("pair_context",{})
+        cluster=round_meta.get("cluster_context",{})
+        regime=sig.get("regime",{})
+
+        model_cons=clamp(float(sig.get("model_consensus",0.0)),0,1)
+        temporal=clamp(float(sig.get("window_agreement",0.0))/0.70,0,1)
+        reliability=clamp(float(puller_report.get("reliability",0.0)),0,1)
+        local_skill=clamp(float(local.get("skill",0.0)),0,1)
+        cov_lift=clamp((float(sig.get("coverage_lift",1.0))-1.0)/0.20,0,1)
+        stability=1-clamp(float(regime.get("tv",0.0))/REGIME_BLOCK_TV,0,1)
+        ai_align=clamp(float(round_meta.get("ai_alignment",0.0))/0.45,0,1)
+
+        evidence=round(100*clamp(
+            .22*model_cons+.16*temporal+.16*reliability+.15*local_skill+
+            .11*cov_lift+.10*stability+.10*ai_align,0,1
+        ),1)
+
+        blockers=[]
+        if int(local.get("n",0))<ROUND_LOCAL_MIN_EVENTS:
+            blockers.append(f"pouco histórico local do {source}: {local.get('n',0)}/{ROUND_LOCAL_MIN_EVENTS}")
+        if reliability<.35: blockers.append("puxadores do número atual com baixa confiabilidade")
+        if model_cons<MIN_MODEL_CONSENSUS: blockers.append("consenso geral baixo")
+        if float(sig.get("window_agreement",0.0))<MIN_WINDOW_AGREEMENT: blockers.append("janelas temporais discordando")
+        if regime.get("level")=="MUDANÇA_FORTE": blockers.append("mudança forte de regime")
+        if puller_weight<.01: blockers.append("puxadores sem skill validado para influenciar")
+
+        if evidence>=ROUND_STRONG_EVIDENCE and not blockers: label="FORTE"
+        elif evidence>=ROUND_GOOD_EVIDENCE and len(blockers)<=1: label="BOA"
+        elif evidence>=55: label="MODERADA"
+        else: label="FRACA"
+
+        top_pullers=[]
+        for item in (puller_report.get("top") or [])[:8]:
+            t=int(item["target"]); zone=neighbors(t,2)
+            top_pullers.append({
+                **item,"zone":zone,
+                "zone_probability_pct":100*mass(probs,zone),
+                "in_final_centers":t in set(sig.get("centers") or []),
+                "in_final_coverage":t in set(sig.get("coverage") or []),
+            })
+
+        return {
+            "source_round_id":self.history[-1]["id"] if self.history else None,
+            "source":source,"previous":previous,
+            "evidence_score":evidence,"evidence_label":label,
+            "note":"Índice de evidência estatística da rodada; não é porcentagem de chance.",
+            "blockers":blockers,"top_pullers":top_pullers,
+            "local_validation":local,"pair_context":pair,"cluster_context":cluster,
+            "weights":{"ai_pct":100*ai_weight,"ai_skill_pct":100*ai_skill,
+                       "puller_pct":100*puller_weight,"puller_global_skill_pct":100*puller_skill,
+                       "ai_alignment_pct":100*float(round_meta.get("ai_alignment",0.0)),
+                       "models_pct":{k:100*v for k,v in (round_meta.get("model_weights") or {}).items()}},
+            "temperature":round_meta.get("temperature",{}),
+            "final":{"signal":sig.get("signal"),"quality":sig.get("quality"),
+                     "centers":sig.get("centers"),"coverage":sig.get("coverage"),
+                     "coverage_lift":sig.get("coverage_lift"),
+                     "model_consensus_pct":100*float(sig.get("model_consensus",0.0)),
+                     "temporal_consensus_pct":100*float(sig.get("window_agreement",0.0)),
+                     "regime":sig.get("regime")}
+        }
+
+    def ensure_prediction(self):
+        if not self.history: return
+        last=self.history[-1]
+        if self.db.prediction_exists(last["id"]): return
+        probs,matrix,blend,ai_skill,puller_blend,puller_skill,puller_report,round_meta=self.ensemble()
+        metrics=self.db.metrics()
+        calibration=self.db.calibration(600)
+        sig=make_signal(probs,self.nums(),self.ai,matrix,metrics,calibration,round_meta.get("model_weights"))
+
+        edge=self.db.professional_edge_evidence(PRO_EVIDENCE_LIMIT,APP_VERSION)
+        tracker_metrics=self.model_tracker.metrics(round_meta.get("current_regime"))
+        ai_metrics=self.ai.metrics()
+        puller_metrics=self.puller.metrics()
+        sig,professional=apply_professional_gate(sig,edge,tracker_metrics,ai_metrics,puller_metrics)
+
+        round_analysis=self.build_round_analysis(
+            probs,sig,puller_report,round_meta,
+            blend,ai_skill,puller_blend,puller_skill
+        )
+        round_analysis["professional"]=professional
+        round_analysis["learning_curve"]=self.db.learning_curve(600,PRO_LEARNING_BIN)
+
+        self.db.insert_prediction({
+            "source_round_id":last["id"],"source_number":last["number"],"predicted_at":now_iso(),
+            "signal":sig["signal"],"quality":sig["quality"],"threshold":sig["threshold"],
+            "reason":sig["reason"],"centers":sig["centers"],"zones":sig["zones"],
+            "coverage":sig["coverage"],"center_details":sig["center_details"],
+            "probs":probs,"features":matrix,"weights":list(self.ai.weights),
+            "ai_metrics":{**self.ai.metrics(),"blend_weight":blend,"skill":ai_skill,
+                          "puller_blend_weight":puller_blend,"puller_skill":puller_skill,
+                          "puller_source":puller_report.get("source"),
+                          "puller_support":puller_report.get("source_support",0),
+                          "puller_reliability":puller_report.get("reliability",0),
+                          "ai_alignment":round_meta.get("ai_alignment",0)},
+            "round_analysis":round_analysis,"model_version":APP_VERSION
+        })
+
+    def status(self):
+        if not self.history:
+            return {
+                "ok":False,
+                "error":self.last_error or "Sem histórico",
+                "network":{
+                    "state":self.network_state,
+                    "errors":self.consecutive_errors,
+                    "last_success":self.last_success,
+                }
+            }
+
+        self.ensure_prediction()
+        h=self.db.history(1)
+        current=dict(h[0]) if h else None
+
+        # Nunca exibe entrada ativa se a fonte estiver velha/offline.
+        age=iso_age_seconds(self.last_success)
+        stale=(self.network_state!="ONLINE") or (age is not None and age>STALE_DATA_SECONDS)
+        if stale and current:
+            current["original_signal"]=current.get("signal")
+            current["signal"]="RED"
+            current["reason"]="DADOS DESATUALIZADOS/OFFLINE • "+str(current.get("reason") or "")
+
+        ai_metrics=self.ai.metrics()
+        puller_metrics=self.puller.metrics()
+        _pull_probs,current_puller_report=puller_model(self.nums())
+        current_regime=regime_analysis(self.nums()).get("level","WARMUP")
+        professional_edge=self.db.professional_edge_evidence(PRO_EVIDENCE_LIMIT,APP_VERSION)
+        professional_models=self.model_tracker.metrics(current_regime)
+        learning_curve=self.db.learning_curve(600,PRO_LEARNING_BIN)
+        current_ai=(current or {}).get("ai_metrics",{}) if current else {}
+        return {
+            "ok":True,
+            "version":APP_VERSION,
+            "game":{
+                "type":"megaroulette",
+                "table":"Mega Roulette",
+                "api_filter":"isLightningNumberMatched=false",
+                "filtered_dataset":True,
+                "warning":"Lucky numbers/multipliers são monitorados, mas não entram na previsão principal porque a API está filtrada."
+            },
+            "last":self.history[-1],
+            "mega":self.db.mega_stats(MEGA_STATS_WINDOW),
+            "spins":self.db.count_spins(),
+            "collector":self.collector_running,
+            "last_fetch":self.last_fetch,
+            "last_error":self.last_error,
+            "network":{
+                "state":self.network_state,
+                "consecutive_errors":self.consecutive_errors,
+                "last_success":self.last_success,
+                "age_seconds":age,
+                "stale":stale,
+                "latency_ms":self.last_latency_ms,
+            },
+            "cloud":{
+                "mode":CLOUD_MODE,
+                "booted_at":self.booted_at,
+                "collector_restarts":self.collector_restarts,
+                "last_backfill_pages":self.last_backfill_pages,
+                "last_backfill_new":self.last_backfill_new,
+                "deep_sync_interval":DEEP_SYNC_INTERVAL,
+                "max_backfill_pages":MAX_BACKFILL_PAGES,
+                "data_dir":str(DATA_DIR),
+                "db_file":str(DB_FILE),
+            },
+            "current":current,
+            "metrics":self.db.metrics(),
+            "rolling":{
+                "50":self.db.metrics(50),
+                "100":self.db.metrics(100),
+                "300":self.db.metrics(300),
+            },
+            "calibration":self.db.calibration(600),
+            "ai":{**ai_metrics,
+                  "effective_blend_weight":current_ai.get("blend_weight",0),
+                  "skill":current_ai.get("skill",0),
+                  "uniform_log_loss":UNIFORM_LOG_LOSS},
+            "pullers":{
+                  "current":current_puller_report,
+                  "validator":puller_metrics,
+                  "effective_blend_weight":current_ai.get("puller_blend_weight",0),
+                  "effective_skill":current_ai.get("puller_skill",0)},
+            "round_analysis":(current or {}).get("round_analysis",{}),
+            "adaptive_models":professional_models,
+            "professional":{
+                "edge":professional_edge,
+                "models":professional_models,
+                "learning_curve":learning_curve,
+                "current":((current or {}).get("round_analysis",{}) or {}).get("professional",{}),
+            },
+            "temperature":self.db.temperature_calibration(TEMP_CALIBRATION_LIMIT,APP_VERSION),
+            "number_total":self.db.count_spins(),
+            "integrity":self.db.integrity(),
+        }
+
+    def loop(self):
+        self.collector_running=True
+        wait_seconds=COLLECT_INTERVAL
+
+        # Na inicialização sempre tenta preencher a lacuna desde o último round salvo.
+        need_deep_sync=True
+
+        while not self.stop_event.is_set():
+            try:
+                elapsed=(
+                    time.monotonic()-self.last_deep_sync_monotonic
+                    if self.last_deep_sync_monotonic
+                    else DEEP_SYNC_INTERVAL+1
+                )
+                do_deep=(
+                    need_deep_sync
+                    or self.consecutive_errors>0
+                    or elapsed>=DEEP_SYNC_INTERVAL
+                )
+
+                new=self.fetch(deep=do_deep)
+
+                if new:
+                    if do_deep:
+                        log.info(
+                            "Cloud sync recuperou %s novo(s) giro(s) em %s página(s)",
+                            new,
+                            self.last_backfill_pages,
+                        )
+                    else:
+                        log.info("Coleta recuperou %s novo(s) giro(s)",new)
+
+                need_deep_sync=False
+                wait_seconds=COLLECT_INTERVAL
+
+            except requests.RequestException as e:
+                self.consecutive_errors+=1
+                self.network_state="OFFLINE"
+                self.last_error=f"{type(e).__name__}: {e}"
+
+                # Ao voltar, deep sync será obrigatório.
+                need_deep_sync=True
+
+                wait_seconds=min(
+                    BACKOFF_MAX,
+                    max(
+                        COLLECT_INTERVAL,
+                        COLLECT_INTERVAL*(2**min(self.consecutive_errors-1,4))
+                    )
+                )
+
+                self.db.save_collector_state({
+                    "last_success":self.last_success,
+                    "last_error":self.last_error,
+                    "network_state":self.network_state,
+                    "consecutive_errors":self.consecutive_errors,
+                    "next_retry_seconds":wait_seconds,
+                    "cloud_mode":CLOUD_MODE,
+                })
+
+                if self.consecutive_errors in (1,2,3) or self.consecutive_errors%10==0:
+                    log.warning(
+                        "API indisponível (%s). Tentativa %s; nova tentativa em %ss. "
+                        "O banco permanece preservado.",
+                        type(e).__name__,
+                        self.consecutive_errors,
+                        wait_seconds,
+                    )
+
+            except Exception as e:
+                self.consecutive_errors+=1
+                self.network_state="ERRO"
+                self.last_error=f"{type(e).__name__}: {e}"
+                need_deep_sync=True
+                wait_seconds=min(BACKOFF_MAX,30)
+                log.exception("Erro inesperado na coleta cloud")
+
+            self.stop_event.wait(wait_seconds)
+
+        self.collector_running=False
+
+# ============================================================
+# FLASK
+# ============================================================
+
+db=DB(DB_FILE)
+engine=Engine(db)
+app=Flask(__name__)
+
+def auth_ok():
+    if not PANEL_USER or not PANEL_PASSWORD: return True
+    h=request.headers.get("Authorization","")
+    if not h.startswith("Basic "): return False
+    try:
+        raw=base64.b64decode(h.split(" ",1)[1]).decode()
+        u,p=raw.split(":",1)
+        return u==PANEL_USER and p==PANEL_PASSWORD
+    except Exception:
+        return False
+
+@app.before_request
+def check_auth():
+    if auth_ok(): return None
+    return Response("Login necessário",401,{"WWW-Authenticate":'Basic realm="Clean AI"'})
+
+HTML = """
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mega Roulette AI V3.5 Professional</title><style>
+:root{--bg:#071019;--card:#101923;--line:#2a3a4d;--text:#eef5fb;--muted:#92a3b8;--green:#31d684;--yellow:#f6c94c;--red:#ff6278;--cyan:#58c7ff;--purple:#bd8cff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,#16293b,#071019 48%);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{max-width:1220px;margin:auto;padding:14px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:10px}.card{background:rgba(16,25,35,.95);border:1px solid var(--line);border-radius:18px;padding:14px;box-shadow:0 12px 30px rgba(0,0,0,.18)}.s12{grid-column:span 12}.s6{grid-column:span 6}.s4{grid-column:span 4}@media(max-width:780px){.s6,.s4{grid-column:span 12}}h1{font-size:24px;margin:2px 0}h2{font-size:17px;margin:0 0 10px}.muted{color:var(--muted);font-size:12px}.signal{font-size:37px;font-weight:950}.GREEN,.GREEN_PLUS,.GREEN_ELITE{color:var(--green)}.YELLOW{color:var(--yellow)}.RED{color:var(--red)}.badge{display:inline-block;padding:5px 8px;margin:3px;border:1px solid var(--line);border-radius:999px;font-size:11px}.online{color:var(--green)}.offline{color:var(--red)}.metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.metric{background:#0b141e;border:1px solid #223247;border-radius:12px;padding:9px}.metric b{font-size:19px}.centers{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}@media(max-width:720px){.centers{grid-template-columns:1fr}}.center{background:#0b141e;border:1px solid #26394f;border-radius:14px;padding:11px}.num{font-size:31px;font-weight:950}.bar{height:7px;background:#26364a;border-radius:99px;overflow:hidden}.fill{height:100%;background:linear-gradient(90deg,#31d684,#58c7ff)}
+.number-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:6px}@media(max-width:720px){.number-grid{grid-template-columns:repeat(4,1fr)}}.ntile{background:#0b141e;border:1px solid #293a4e;border-radius:12px;padding:8px;text-align:center}.ntile .n{font-size:24px;font-weight:950}.ntile.redn .n{color:#ff7b8d}.ntile.greenn .n{color:#46e59a}.ntile.blackn .n{color:#f0f3f7}.ntile.hot{box-shadow:0 0 0 1px #f6c94c inset}.ntile.delayed{border-color:#bd8cff}
+.puller-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px}@media(max-width:720px){.puller-grid{grid-template-columns:repeat(2,1fr)}}.puller{background:#0b141e;border:1px solid #293a4e;border-radius:12px;padding:9px}.puller strong{font-size:25px}.model-list{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}@media(max-width:720px){.model-list{grid-template-columns:repeat(2,1fr)}}.model{background:#0b141e;border:1px solid #293a4e;border-radius:12px;padding:9px}.tablewrap{overflow:auto;max-height:560px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #26364a;text-align:left;white-space:nowrap}.pager{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}.btn{background:#152437;color:#eef5fb;border:1px solid #32475f;padding:8px 12px;border-radius:10px;cursor:pointer;text-decoration:none}.roundscore{font-size:34px;font-weight:950}.blocker{display:inline-block;background:#2b1820;color:#ff9cab;border-radius:999px;padding:5px 8px;margin:3px;font-size:11px}.wheel-line{display:flex;gap:4px;overflow:auto}.wn{min-width:35px;height:35px;border-radius:50%;display:grid;place-items:center;background:#202932;border:1px solid #3a4a5c;font-size:11px;font-weight:800}.wn.cover{box-shadow:0 0 0 2px #f6c94c inset}.wn.centerN{background:#146a45}.wn.last{outline:2px solid #58c7ff}
+
+.probox{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}@media(max-width:720px){.probox{grid-template-columns:repeat(2,1fr)}}
+.prodecision{font-size:31px;font-weight:950}.prodecision.APROVADA{color:#31d684}.prodecision.OBSERVAR{color:#f6c94c}.prodecision.REJEITADA{color:#ff6278}
+</style></head><body><div class="wrap"><h1>🎯 Mega Roulette AI V3.5 Professional</h1><div class="muted">IA profissional adaptativa • memória rápida/lenta • análise por rodada • puxadores • cloud 24/7</div><br><div class="grid">
+<section class="card s12"><div id="sig" class="signal">CARREGANDO...</div><div id="score"></div><div id="reason" class="muted"></div><div id="net"></div></section>
+<section class="card s12"><h2>🧠 Mesa profissional da IA</h2>
+<div id="proDecision" class="prodecision">CARREGANDO...</div><div id="proReason" class="muted"></div>
+<div id="proMetrics" class="probox" style="margin-top:10px"></div><div id="learningTrend" class="muted" style="margin-top:9px"></div></section>
+<section class="card s12"><h2>🔬 Rodada atual</h2><div id="round"></div></section>
+<section class="card s12"><h2>🎯 3 centros + vizinhos</h2><div id="centers" class="centers"></div><br><div id="wheel" class="wheel-line"></div><div id="coverage" class="muted" style="margin-top:8px"></div></section>
+<section class="card s12"><h2>🧲 Números que se puxam nesta rodada</h2><div id="pullerMeta" class="muted"></div><div id="pullers" class="puller-grid" style="margin-top:8px"></div></section>
+<section class="card s12"><h2>🧠 Pesos adaptativos dos modelos</h2><div class="muted">Modelos que erram perdem peso; modelos com melhor log loss recente ganham peso gradualmente.</div><div id="models" class="model-list" style="margin-top:8px"></div><div id="temp" class="muted" style="margin-top:8px"></div></section>
+<section class="card s12"><h2>🔢 Contador completo dos números 0–36</h2><div id="numberSummary" class="muted"></div><div id="numbers" class="number-grid" style="margin-top:9px"></div></section>
+<section class="card s12"><h2>📜 Todos os giros coletados</h2><div class="pager"><button class="btn" onclick="prevPage()">◀ Anterior</button><button class="btn" onclick="nextPage()">Próxima ▶</button><span id="pageInfo" class="muted"></span><a class="btn" href="/api/spins.csv">CSV completo</a></div><div class="tablewrap"><table><thead><tr><th>#</th><th>Horário</th><th>Número</th><th>Lucky</th><th>Round ID</th></tr></thead><tbody id="spinsBody"></tbody></table></div></section>
+<section class="card s6"><h2>📈 Validação</h2><div id="validation" class="metrics"></div></section><section class="card s6"><h2>☁️ Cloud 24/7</h2><div id="cloud" class="metrics"></div></section>
+<section class="card s12"><h2>🎫 Histórico de previsões</h2><div class="tablewrap"><table><thead><tr><th>Hora</th><th>Sinal</th><th>Centros</th><th>Saiu</th><th>Resultado</th><th>P&L</th></tr></thead><tbody id="predBody"></tbody></table></div></section>
+</div></div><script>
+const W=[0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26];const REDS=new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);let spinOffset=0;const spinLimit=100;const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));const box=(a,b,c='')=>`<div class="metric"><span class="muted">${a}</span><br><b>${b}</b><br><span class="muted">${c}</span></div>`;
+function nclass(n){return n===0?'greenn':REDS.has(n)?'redn':'blackn'}
+async function loadSpins(){const d=await (await fetch(`/api/spins?limit=${spinLimit}&offset=${spinOffset}`)).json();document.getElementById('pageInfo').textContent=`${Math.min(d.total,spinOffset+1)}–${Math.min(d.total,spinOffset+d.items.length)} de ${d.total}`;document.getElementById('spinsBody').innerHTML=(d.items||[]).map(x=>`<tr><td>${x.seq}</td><td>${esc(x.settledAt||'—')}</td><td><b>${x.number}</b></td><td>${(x.luckyNumbers||[]).map(y=>`${y.number}:${y.roundedMultiplier}x`).join(' • ')||'—'}</td><td>${esc(x.id)}</td></tr>`).join('')}
+function nextPage(){spinOffset+=spinLimit;loadSpins().catch(console.error)}function prevPage(){spinOffset=Math.max(0,spinOffset-spinLimit);loadSpins().catch(console.error)}
+async function refresh(){const d=await (await fetch('/api/status')).json();if(!d.ok){document.getElementById('sig').textContent='SEM DADOS';return}const c=d.current||{},sig=c.signal||'RED',se=document.getElementById('sig');se.className='signal '+(sig.startsWith('GREEN')?sig:sig);se.textContent=(sig==='GREEN_ELITE'?'🟢⚡ ':sig==='GREEN_PLUS'?'🟢🔥 ':sig==='GREEN'?'🟢 ':sig==='YELLOW'?'🟡 ':'🔴 ')+sig;document.getElementById('score').innerHTML=`<b>Qualidade ${Number(c.quality||0).toFixed(1)}/100</b> • limite ${Number(c.threshold||0).toFixed(1)}`;document.getElementById('reason').textContent=c.reason||'';const net=d.network||{},cl=d.cloud||{};document.getElementById('net').innerHTML=`<span class="badge ${net.state==='ONLINE'?'online':'offline'}">● ${esc(net.state||'')}</span><span class="badge">${cl.mode?'☁️ CLOUD 24/7':'📱 LOCAL'}</span><span class="badge">${d.spins||0} giros</span><span class="badge">backfill ${cl.last_backfill_pages||0} pág.</span>`;
+const pro=d.professional||{},pc=pro.current||{},pe=pro.edge||{},peg=pe.green||{},pmods=pro.models||{},lc=pro.learning_curve||{};
+const pd=document.getElementById('proDecision');pd.className='prodecision '+(pc.decision||'REJEITADA');pd.textContent=(pc.decision||'REJEITADA')+' • '+Number(pc.grade||0).toFixed(0)+'/100';
+document.getElementById('proReason').textContent=(pc.reasons||[]).join(' • ')||'Aguardando evidência fora da amostra suficiente.';
+document.getElementById('proMetrics').innerHTML=box('Green OOS',peg.n||0,'amostra resolvida')+box('Acerto vs base',Number(peg.observed_pct||0).toFixed(1)+'%',Number(peg.expected_pct||0).toFixed(1)+'% esperado')+box('z-score',Number(peg.z_score||0).toFixed(2),'edge '+Number(peg.edge_pp||0).toFixed(1)+' pp')+box('Modelos validados',(pmods.models_beating_uniform||0)+'/'+(pmods.mature_models||0),'maduros acima uniforme');
+const tr=lc.trend_log_loss_improvement;document.getElementById('learningTrend').textContent=`Aprendizado: ${tr==null?'curva ainda pequena':(tr>0?'melhora ':'piora ')+Math.abs(Number(tr)).toFixed(3)+' LL'} • ${lc.improving?'tendência positiva':'monitorando'}`;
+const ra=d.round_analysis||{},rv=ra.local_validation||{},rw=ra.weights||{},rf=ra.final||{};document.getElementById('round').innerHTML=`<div class="roundscore">${Number(ra.evidence_score||0).toFixed(0)}/100 • ${esc(ra.evidence_label||'—')}</div><div class="muted">Fonte ${ra.source??'—'} • anterior ${ra.previous??'—'} • TOP5 local ${Number(rv.top5_pct||0).toFixed(1)}% em ${rv.n||0} ocorrências • skill local ${(100*Number(rv.skill||0)).toFixed(0)}%</div><div>${(ra.blockers||[]).map(x=>`<span class="blocker">⚠ ${esc(x)}</span>`).join('')}</div>`;
+const details=c.center_details||[];document.getElementById('centers').innerHTML=details.map(x=>`<div class="center"><div class="num">${x.center}</div><b>${Number(x.score||0).toFixed(1)}/100</b><div class="bar"><div class="fill" style="width:${Math.min(100,Number(x.score||0))}%"></div></div><span class="muted">zona ${(100*Number(x.zone_probability||0)).toFixed(2)}% • lift ${Number(x.zone_lift||0).toFixed(2)}x • consenso ${(100*Number(x.model_consensus||0)).toFixed(0)}%</span><br><span class="muted">🧲 lift ${Number(x.puller_zone_lift||0).toFixed(2)}x • suporte ${x.puller_support||0}</span></div>`).join('');const cov=new Set(c.coverage||[]),cent=new Set(c.centers||[]);document.getElementById('wheel').innerHTML=W.map(n=>`<div class="wn ${cov.has(n)?'cover':''} ${cent.has(n)?'centerN':''} ${Number(d.last.number)===n?'last':''}">${n}</div>`).join('');document.getElementById('coverage').textContent=`Cobertura: ${(c.coverage||[]).join(' • ')} • ${(c.coverage||[]).length} números`;
+const pr=d.pullers||{},prep=pr.current||{},tops=ra.top_pullers||prep.top||[];document.getElementById('pullerMeta').textContent=`Último ${prep.source??'—'} • suporte ${prep.source_support||0} • confiabilidade ${(100*Number(prep.reliability||0)).toFixed(0)}% • peso atual ${Number((rw.puller_pct||0)).toFixed(1)}%`;document.getElementById('pullers').innerHTML=tops.slice(0,10).map(x=>`<div class="puller"><span class="muted">${prep.source} →</span><br><strong>${x.target}</strong><br><b>${Number(x.strength||0).toFixed(0)}/100</b><br><span class="muted">lift ${Number(x.long_lift||0).toFixed(2)}x • ${x.count}/${x.source_support}<br>recente ${Number(x.recent_lift||0).toFixed(2)}x • 2-passos ${Number(x.pair_lift||0).toFixed(2)}x</span></div>`).join('');
+const ad=d.adaptive_models||{},mods=ad.models||{};document.getElementById('models').innerHTML=Object.entries(mods).map(([k,v])=>`<div class="model"><b>${esc(k)}</b><br><strong>${Number(v.weight_pct||0).toFixed(1)}%</strong><br><span class="muted">n ${v.n||0} • regime ${v.regime_n||0}<br>LL rápido ${v.fast_log_loss==null?'—':Number(v.fast_log_loss).toFixed(3)} • lento ${v.slow_log_loss==null?'—':Number(v.slow_log_loss).toFixed(3)}<br>TOP5 ${Number(v.slow_top5_pct||0).toFixed(1)}% • ${v.beats_uniform?'✓ acima base':'· sem vantagem validada'}</span></div>`).join('');const t=d.temperature||{};document.getElementById('temp').textContent=`Calibração: T=${Number(t.temperature||1).toFixed(2)} • amostra ${t.n||0} • melhora LL ${Number(t.improvement||0).toFixed(4)} • regime ${ad.regime||'—'}`;
+const cal=d.calibration||{},m=d.metrics||{},a=d.ai||{};document.getElementById('validation').innerHTML=box('IA TOP5',Number(a.top5_pct||0).toFixed(2)+'%','base 13,51%')+box('Skill IA',(100*Number(a.professional_skill||0)).toFixed(0)+'%','LL rápido '+(a.fast_log_loss==null?'—':Number(a.fast_log_loss).toFixed(3)))+box('Greens',m.green_count||0,Number(m.green_hit_pct||0).toFixed(1)+'% acerto')+box('Calibração ECE',Number(cal.ece||0).toFixed(1)+' pp','gap '+Number(cal.gap_pp||0).toFixed(1)+' pp');document.getElementById('cloud').innerHTML=box('Modo',cl.mode?'24/7':'LOCAL',net.state||'—')+box('Último sucesso',net.age_seconds==null?'—':Math.round(net.age_seconds)+'s','idade dos dados')+box('Recuperação',cl.last_backfill_new||0,'novos no último backfill')+box('SQLite',d.integrity||'—',d.spins+' giros');
+const h=await (await fetch('/api/history?limit=100')).json();document.getElementById('predBody').innerHTML=(h.items||[]).map(x=>`<tr><td>${esc(x.predicted_at)}</td><td>${esc(x.signal)}</td><td>${(x.centers||[]).join(' • ')}</td><td>${x.actual==null?'—':x.actual}</td><td>${x.actual==null?'⏳':x.hit?'✅':'❌'}</td><td>${x.paper_pnl==null?'—':'R$ '+Number(x.paper_pnl).toFixed(2)}</td></tr>`).join('')}
+async function loadNumberStats(){const d=await (await fetch('/api/number-stats')).json();document.getElementById('numberSummary').textContent=`Total coletado: ${d.total} • esperado por número: ${Number(d.expected_per_number||0).toFixed(1)} • contagem inclui todo o SQLite`;const hot=new Set((d.most_common||[]).slice(0,4).map(x=>x.number)),delayed=new Set((d.most_delayed||[]).slice(0,4).map(x=>x.number));document.getElementById('numbers').innerHTML=(d.stats||[]).map(x=>`<div class="ntile ${nclass(x.number)} ${hot.has(x.number)?'hot':''} ${delayed.has(x.number)?'delayed':''}"><div class="n">${x.number}</div><b>${x.count}x</b><br><span class="muted">${Number(x.pct||0).toFixed(2)}%<br>atraso ${x.current_gap}<br>20:${x.count20} 100:${x.count100}</span></div>`).join('')}
+refresh().catch(console.error);loadNumberStats().catch(console.error);loadSpins().catch(console.error);setInterval(()=>refresh().catch(console.error),5000);setInterval(()=>loadNumberStats().catch(console.error),15000);
+</script></body></html>
+"""
+
+@app.route("/")
+def home(): return Response(HTML,mimetype="text/html")
+
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+@app.route("/health")
+def health():
+    integrity=db.integrity()
+    return jsonify({
+        "ok":integrity=="ok",
+        "version":APP_VERSION,
+        "collector":engine.collector_running,
+        "integrity":integrity,
+        "db_recovery":db.recovery_info(),
+    })
+
+@app.route("/api/status")
+def status(): return jsonify(engine.status())
+
+@app.route("/api/history")
+def history():
+    try: limit=max(1,min(500,int(request.args.get("limit","100"))))
+    except Exception: limit=100
+    return jsonify({"ok":True,"items":db.history(limit)})
+
+@app.route("/api/ai")
+def ai(): return jsonify({"ok":True,"metrics":engine.ai.metrics()})
+
+
+@app.route("/api/number-stats")
+def api_number_stats():
+    return jsonify({"ok":True,**db.number_stats()})
+
+@app.route("/api/spins")
+def api_spins():
+    try: limit=max(1,min(SPIN_PAGE_MAX,int(request.args.get("limit","200"))))
+    except Exception: limit=200
+    try: offset=max(0,int(request.args.get("offset","0")))
+    except Exception: offset=0
+    order=str(request.args.get("order","desc")).lower()
+    return jsonify({"ok":True,**db.spin_page(limit,offset,descending=(order!="asc"))})
+
+@app.route("/api/professional")
+def api_professional():
+    st=engine.status()
+    return jsonify({
+        "ok":True,
+        "version":APP_VERSION,
+        "professional":st.get("professional"),
+        "ai":st.get("ai"),
+        "pullers":st.get("pullers"),
+        "current":st.get("current"),
+        "note":"Relatório fora da amostra; não é garantia de lucro ou acerto."
+    })
+
+
+@app.route("/api/model-weights")
+def api_model_weights():
+    regime=regime_analysis(engine.nums()).get("level","WARMUP")
+    return jsonify({"ok":True,"adaptive":engine.model_tracker.metrics(regime),
+                    "temperature":db.temperature_calibration(TEMP_CALIBRATION_LIMIT,APP_VERSION),
+                    "regime":regime})
+
+@app.route("/api/spins.csv")
+def export_spins():
+    with db.lock,db.conn() as c:
+        rows=c.execute("SELECT round_id,number,settled_at,inserted_at,lucky_json,table_name,game_type FROM spins ORDER BY rowid ASC").fetchall()
+    out=io.StringIO(); w=csv.writer(out)
+    w.writerow(["round_id","number","settled_at","inserted_at","lucky_numbers","table_name","game_type"])
+    for r in rows:
+        w.writerow([r["round_id"],r["number"],r["settled_at"],r["inserted_at"],r["lucky_json"],r["table_name"],r["game_type"]])
+    return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":'attachment; filename="mega_all_spins.csv"'})
+
+
+@app.route("/api/diagnostics")
+def diagnostics():
+    st=engine.status()
+    return jsonify({
+        "ok":True,
+        "version":APP_VERSION,
+        "network":st.get("network"),
+        "integrity":db.integrity(),
+        "spins":db.count_spins(),
+        "calibration":db.calibration(600),
+        "mega":db.mega_stats(MEGA_STATS_WINDOW),
+        "rolling":st.get("rolling"),
+        "adaptive_models":st.get("adaptive_models"),
+        "temperature":st.get("temperature"),
+    })
+
+@app.route("/api/round-analysis")
+def api_round_analysis():
+    st=engine.status()
+    if not st.get("ok"):
+        return jsonify(st),503
+    return jsonify({"ok":True,"version":APP_VERSION,"last":st.get("last"),
+                    "analysis":st.get("round_analysis",{}),
+                    "pullers":st.get("pullers",{}),"current":st.get("current"),
+                    "note":"Análise criada antes do próximo resultado; não é garantia de acerto."})
+
+
+@app.route("/api/pullers")
+def api_pullers():
+    try:
+        raw=request.args.get("source")
+        source=None if raw in (None,"") else int(raw)
+        if source is not None and not 0<=source<=36: raise ValueError("source deve estar entre 0 e 36")
+    except Exception as exc:
+        return jsonify({"ok":False,"error":str(exc)}),400
+    nums=engine.nums(); probs,report=puller_model(nums,source=source)
+    return jsonify({"ok":True,"report":report,"top5":topk(probs,5),"validator":engine.puller.metrics(),
+                    "strongest_relations":strongest_puller_relations(nums,15),
+                    "note":"Relações estatísticas históricas; não implicam causalidade física entre giros."})
+
+@app.route("/api/cloud-status")
+def cloud_status():
+    st=engine.status()
+    return jsonify({
+        "ok":True,
+        "version":APP_VERSION,
+        "cloud":st.get("cloud"),
+        "network":st.get("network"),
+        "collector":st.get("collector"),
+        "persisted_collector_state":db.collector_state(),
+        "spins":db.count_spins(),
+        "integrity":db.integrity(),
+    })
+
+@app.route("/api/db-recovery-status")
+def db_recovery_status():
+    return jsonify({
+        "ok":True,
+        "version":APP_VERSION,
+        "db_file":str(DB_FILE),
+        "integrity":db.integrity(),
+        "recovery":db.recovery_info(),
+        "backups":[str(p) for p in sorted(BACKUP_DIR.glob("mega_ai_*.sqlite3"),reverse=True)[:10]],
+    })
+
+@app.route("/api/backup",methods=["POST"])
+def backup(): return jsonify({"ok":True,"backup":db.backup()})
+
+@app.route("/api/export.csv")
+def export():
+    rows=db.history(5000); out=io.StringIO(); w=csv.writer(out)
+    w.writerow(["predicted_at","signal","quality","centers","coverage","actual","hit","paper_pnl","reason"])
+    for x in reversed(rows):
+        w.writerow([x.get("predicted_at"),x.get("signal"),x.get("quality"),
+                    " ".join(map(str,x.get("centers",[])))," ".join(map(str,x.get("coverage",[]))),
+                    x.get("actual"),x.get("hit"),x.get("paper_pnl"),x.get("reason")])
+    return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":'attachment; filename="clean_ai_history.csv"'})
+
+def collector_supervisor():
+    """
+    Se o loop do collector terminar por qualquer falha inesperada,
+    reinicia automaticamente enquanto o processo cloud estiver vivo.
+    """
+    while not engine.stop_event.is_set():
+        try:
+            engine.loop()
+        except Exception:
+            engine.collector_restarts+=1
+            log.exception(
+                "Collector encerrou inesperadamente. Reiniciando em %ss.",
+                COLLECTOR_RESTART_DELAY
+            )
+            engine.stop_event.wait(COLLECTOR_RESTART_DELAY)
+
+        if not engine.stop_event.is_set():
+            engine.collector_restarts+=1
+            engine.stop_event.wait(COLLECTOR_RESTART_DELAY)
+
+
+def backup_loop():
+    # Primeiro backup alguns minutos após subir, depois periodicamente.
+    if engine.stop_event.wait(180):
+        return
+
+    while not engine.stop_event.is_set():
+        try:
+            path=db.backup()
+            log.info("Backup automático criado: %s",path)
+        except Exception:
+            log.exception("Falha no backup automático")
+
+        if engine.stop_event.wait(BACKUP_INTERVAL):
+            break
+
+
+def database_maintenance_loop():
+    last_check=0.0
+    last_checkpoint=0.0
+
+    while not engine.stop_event.is_set():
+        now=time.monotonic()
+
+        if now-last_checkpoint>=WAL_CHECKPOINT_INTERVAL:
+            try:
+                db.checkpoint("PASSIVE")
+            except Exception as exc:
+                log.warning("Checkpoint WAL falhou: %s",exc)
+            last_checkpoint=now
+
+        if now-last_check>=DB_CHECK_INTERVAL:
+            try:
+                status=db.integrity()
+                if status!="ok":
+                    log.error("Quick check SQLite retornou: %s",status)
+                    if DB_AUTO_RECOVER:
+                        db.recover_if_needed(force=True)
+                        db.init()
+            except Exception:
+                log.exception("Falha na manutenção SQLite")
+            last_check=now
+
+        if engine.stop_event.wait(30):
+            break
+
+
+if RUN_COLLECTOR:
+    threading.Thread(
+        target=collector_supervisor,
+        daemon=True,
+        name="collector-supervisor"
+    ).start()
+
+threading.Thread(
+    target=backup_loop,
+    daemon=True,
+    name="backup-loop"
+).start()
+
+threading.Thread(
+    target=database_maintenance_loop,
+    daemon=True,
+    name="database-maintenance"
+).start()
+
+def shutdown():
+    try:
+        engine.stop_event.set()
+    except Exception:
+        pass
+    try:
+        engine.ai.save()
+    except Exception:
+        pass
+    try:
+        engine.puller.save()
+    except Exception:
+        pass
+    try:
+        engine.model_tracker.save()
+    except Exception:
+        pass
+    try:
+        db.backup()
+    except Exception:
+        pass
+
+atexit.register(shutdown)
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","5000")),debug=False,threaded=True)
